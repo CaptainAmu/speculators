@@ -108,7 +108,7 @@ for entry in $SERVERS; do
             name="${label}_${dataset}_c${conc}"
             prompts=$(( PROMPTS_PER_STREAM * conc ))
             prompts=$(( prompts > MIN_PROMPTS ? prompts : MIN_PROMPTS ))
-            curl -s "http://localhost:$PORT/metrics" > "$OUT/$name.metrics_before.txt"
+            curl -s "http://localhost:$PORT/metrics" > "$OUT/$name.metrics_before.txt" || true
             vllm bench serve --backend vllm --port "$PORT" --model "$TARGET" \
                 --dataset-name custom --dataset-path "$OUT/prompts/$dataset.jsonl" \
                 --skip-chat-template --custom-output-len "$MAX_TOKENS" \
@@ -116,7 +116,7 @@ for entry in $SERVERS; do
                 --temperature "$TEMPERATURE" --request-rate inf \
                 --save-result --save-detailed --result-dir "$OUT" --result-filename "$name.json" \
                 > "$OUT/$name.log" 2>&1 || echo "bench $name failed" >&2
-            curl -s "http://localhost:$PORT/metrics" > "$OUT/$name.metrics_after.txt"
+            curl -s "http://localhost:$PORT/metrics" > "$OUT/$name.metrics_after.txt" || true
         done
     done
     stop_server

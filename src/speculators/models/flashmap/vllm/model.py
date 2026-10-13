@@ -589,10 +589,13 @@ class FlashMapDraftModel(nn.Module):
             anchor_context = self.anchor_norm(
                 self.anchor_proj(F.embedding(anchor_rows, self.embed_tokens))
             )
+            # The kernels index positions and slots densely: gather row 0s.
             self._store_context(
                 anchor_context,
-                positions.view(blocks, self.block_size)[:, 0],
-                metadata.slot_mapping[:tokens].view(blocks, self.block_size)[:, 0],
+                positions.view(blocks, self.block_size)[:, 0].contiguous(),
+                metadata.slot_mapping[:tokens]
+                .view(blocks, self.block_size)[:, 0]
+                .contiguous(),
             )
         slot_positions = positions + 1
         dit = self._compiled or self._dit

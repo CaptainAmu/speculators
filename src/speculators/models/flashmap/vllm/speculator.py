@@ -6,6 +6,11 @@ that covers the whole draft step. Its block has DSpark's layout
 (``sample_from_anchor``): ``block_size`` query rows per request, row 0 holding the
 anchor, every row a draft token. What differs is the draft model (model.py) and
 sampling, which reads logits off the folded head over the draft vocabulary.
+
+``num_speculative_tokens`` may be smaller than the block: the draft still
+evaluates its whole block (the DiT's self-attention sees all of it) and proposes
+the first ``num_speculative_tokens`` slots, so verification, which dominates at
+high concurrency, checks fewer tokens.
 """
 
 import torch
@@ -30,9 +35,35 @@ class FlashMapSpeculator(DFlashSpeculator):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
-        # Every one of the block's rows is a draft token; row 0 is the anchor.
+        block_size = int(self.draft_model_config.hf_config.block_size)
+        # Drafts proposed for verification, a prefix of the block.
+        self.num_verify = self.num_speculative_steps
+        if self.num_verify > block_size:
+            raise ValueError(
+                f"num_speculative_tokens={self.num_verify} exceeds FlashMap's "
+                f"block_size={block_size}"
+            )
+        # Every one of the block's rows is a draft slot; row 0 is the anchor.
         self.sample_from_anchor = True
-        self.num_query_per_req = self.num_speculative_steps
+        self.num_query_per_req = block_size
+        if self.num_verify < block_size:
+            # Per-slot buffers for the whole block (the DFlash ones are sized
+            # for the verified drafts).
+            self.num_speculative_steps = block_size
+            num_slots = self.max_num_reqs * block_size
+            self.draft_tokens = torch.zeros(
+                self.max_num_reqs, block_size, dtype=torch.int64, device=device
+            )
+            self.sample_indices = torch.zeros(
+                num_slots, dtype=torch.int64, device=device
+            )
+            self.sample_pos = torch.zeros(num_slots, dtype=torch.int64, device=device)
+            self.sample_idx_mapping = torch.full(
+                (num_slots,), -1, dtype=torch.int32, device=device
+            )
+            self.sample_col = torch.arange(
+                block_size, dtype=torch.int32, device=device
+            ).repeat(self.max_num_reqs)
         self._full_logits: torch.Tensor | None = None
 
     def load_draft_model(
@@ -95,7 +126,50 @@ class FlashMapSpeculator(DFlashSpeculator):
         self.model.cache_layout()
         super().capture()
 
+    def propose(self, *args, **kwargs) -> torch.Tensor:
+        return super().propose(*args, **kwargs)[:, : self.num_verify]
+
     def sample_draft(
+        self,
+        hidden_states: torch.Tensor,
+        sample_src_positions: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        draft_step: torch.Tensor,
+        draft_logits: torch.Tensor | None,
+    ) -> torch.Tensor:
+        block, verify = self.num_speculative_steps, self.num_verify
+        if verify == block:
+            return self._sample(
+                hidden_states,
+                sample_src_positions,
+                idx_mapping,
+                temperature,
+                seeds,
+                draft_step,
+                draft_logits,
+            )
+        # Sample the verified prefix of each block only; the rest stay zero.
+        num_blocks = hidden_states.shape[0] // block
+
+        def prefix(t: torch.Tensor) -> torch.Tensor:
+            return t.view(num_blocks, block, *t.shape[1:])[:, :verify].flatten(0, 1)
+
+        sampled = self._sample(
+            prefix(hidden_states),
+            prefix(sample_src_positions),
+            prefix(idx_mapping),
+            temperature,
+            seeds,
+            prefix(draft_step),
+            draft_logits,
+        )
+        tokens = sampled.new_zeros(num_blocks, block)
+        tokens[:, :verify] = sampled.view(num_blocks, verify)
+        return tokens.view(-1)
+
+    def _sample(
         self,
         hidden_states: torch.Tensor,
         sample_src_positions: torch.Tensor,

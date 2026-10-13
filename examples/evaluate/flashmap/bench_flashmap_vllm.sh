@@ -112,7 +112,7 @@ for entry in $SERVERS; do
             vllm bench serve --backend vllm --port "$PORT" --model "$TARGET" \
                 --dataset-name custom --dataset-path "$OUT/prompts/$dataset.jsonl" \
                 --skip-chat-template --custom-output-len "$MAX_TOKENS" \
-                --num-prompts "$prompts" --max-concurrency "$conc" \
+                --num-prompts "$prompts" --max-concurrency "$conc" --num-warmups 2 \
                 --temperature "$TEMPERATURE" --request-rate inf \
                 --save-result --save-detailed --result-dir "$OUT" --result-filename "$name.json" \
                 > "$OUT/$name.log" 2>&1 || echo "bench $name failed" >&2

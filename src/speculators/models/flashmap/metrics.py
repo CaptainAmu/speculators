@@ -38,7 +38,7 @@ def slot_loss_weights(
 
 def _counted(metrics: dict[str, Any], name: str, num, den) -> None:
     metrics[f"{name}_sum"] = num.detach().float()
-    metrics[f"{name}_total"] = torch.as_tensor(den).detach().float()
+    metrics[f"{name}_total"] = torch.as_tensor(den, device=num.device).detach().float()
 
 
 def compute_flow_loss(

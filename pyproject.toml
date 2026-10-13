@@ -146,6 +146,10 @@ dev = [
 [project.entry-points.console_scripts]
 speculators = "speculators.__main__:app"
 
+# FlashMap drafting in vLLM (speculators.models.flashmap.vllm).
+[project.entry-points."vllm.general_plugins"]
+flashmap = "speculators.models.flashmap.vllm:register"
+
 [project.urls]
 homepage = "https://github.com/vllm-project/speculators"
 source = "https://github.com/vllm-project/speculators"

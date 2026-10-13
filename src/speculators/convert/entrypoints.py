@@ -7,6 +7,7 @@ research repositories:
 - EAGLE3
 - MTP
 - DFlash
+- FlashMap
 
 Functions:
     convert_model: Converts a model checkpoint to the Speculators format.
@@ -21,6 +22,7 @@ from transformers import PretrainedConfig
 
 from speculators.convert.dflash.converter import DFlashConverter
 from speculators.convert.eagle.eagle3_converter import Eagle3Converter
+from speculators.convert.flashmap.converter import FlashMapConverter
 from speculators.convert.mtp.converter import MTPConverter
 
 __all__ = ["convert_model", "maybe_convert_external_checkpoint"]
@@ -29,7 +31,7 @@ __all__ = ["convert_model", "maybe_convert_external_checkpoint"]
 def convert_model(
     model: str,
     verifier: str,
-    algorithm: Literal["eagle3", "mtp", "dflash"],
+    algorithm: Literal["eagle3", "mtp", "dflash", "flashmap"],
     output_path: str = "converted",
     validate_device: str | None = None,
     **kwargs,
@@ -75,6 +77,15 @@ def convert_model(
             algorithm="dflash",
         )
 
+    algorithm=="flashmap":
+        FlashMap: a released checkpoint or a DeepSpec flow-map checkpoint
+        ::
+        convert_model(
+            model="./FlashMap-Qwen3-8B",
+            verifier="Qwen/Qwen3-8B",
+            algorithm="flashmap",
+        )
+
     :param model: Path to the input model checkpoint or Hugging Face model ID.
     :param verifier: Verifier model checkpoint or Hugging Face model ID
         to attach as the verification/base model for speculative decoding
@@ -86,6 +97,8 @@ def convert_model(
         "eagle_aux_hidden_state_layer_ids": [1,23,44]}.
         Options for MTP: {"num_speculative_steps": 3}.
         Options for DFlash: {"aux_hidden_state_layer_ids": [2,10,18,26,34]}.
+        Options for FlashMap: {"num_steps": 1, "draft_vocab_size": 65536,
+        "draft_vocab_file": "ranking.safetensors"}.
     """
 
     if algorithm == "eagle3":
@@ -106,6 +119,14 @@ def convert_model(
         )
     elif algorithm == "dflash":
         DFlashConverter().convert(
+            model,
+            output_path,
+            verifier,
+            validate=validate_device is not None,
+            **kwargs,
+        )
+    elif algorithm == "flashmap":
+        FlashMapConverter().convert(
             model,
             output_path,
             verifier,

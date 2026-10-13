@@ -44,7 +44,11 @@ class DecodingErrorSchedule:
     def __init__(self, vocab_size: int, table_size: int = 4001):
         if vocab_size < 2:  # noqa: PLR2004
             raise ValueError("vocab_size must be at least 2")
-        t_table = torch.linspace(0.0, 1.0, table_size, dtype=torch.float64)
+        # Explicitly on the CPU: models are built under a meta-device context
+        # when loaded with from_pretrained.
+        t_table = torch.linspace(
+            0.0, 1.0, table_size, dtype=torch.float64, device="cpu"
+        )
         p_e = decoding_error_rate(t_table, vocab_size)
         p_e0 = 1.0 - 1.0 / vocab_size
         tau_table = ((p_e0 - p_e) / p_e0).clamp(0.0, 1.0)

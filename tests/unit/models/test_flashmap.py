@@ -245,6 +245,9 @@ def test_checkpoint_layout(tmp_path):
 
     loaded = FlashMapDraftModel.from_pretrained(tmp_path)
     assert loaded.config.flow_map
+    times = loaded.time_schedule.grid(2, torch.device("cpu"))
+    assert torch.isfinite(times).all()
+    assert times.device.type == "cpu"
     for name, tensor in flow_map.state_dict().items():
         if name.split(".")[0] in {"embed_tokens", "lm_head", "verifier_lm_head"}:
             continue

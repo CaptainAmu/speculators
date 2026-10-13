@@ -4,6 +4,7 @@ from .dflash import DFlashDraftModel, DFlashSpeculatorConfig
 from .dflash2 import DFlash2DraftModel, DFlash2SpeculatorConfig
 from .dspark import DSparkDraftModel, DSparkSpeculatorConfig
 from .eagle3 import Eagle3DraftModel, Eagle3SpeculatorConfig
+from .flashmap import FlashMapSpeculatorConfig
 from .mtp import MTPDraftModel, MTPSpeculatorConfig
 from .peagle import PEagleDraftModel, PEagleSpeculatorConfig
 from .xpress import XPressDraftModel, XPressSpeculatorConfig
@@ -17,6 +18,7 @@ __all__ = [
     "DSparkSpeculatorConfig",
     "Eagle3DraftModel",
     "Eagle3SpeculatorConfig",
+    "FlashMapSpeculatorConfig",
     "MTPDraftModel",
     "MTPSpeculatorConfig",
     "PEagleDraftModel",

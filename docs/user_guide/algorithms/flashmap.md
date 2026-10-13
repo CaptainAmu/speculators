@@ -70,6 +70,35 @@ The draft step (`speculators/models/flashmap/vllm/`) is built for latency:
 - the DiT's output head is folded into the LM head;
 - the DiT is compiled with torch.compile and the whole draft step runs in vLLM's full CUDA graph, with no host synchronization.
 
+### Performance
+
+Qwen3-8B on one A100-SXM4-80GB (power-capped to 225 W, so absolute numbers are low), vLLM 0.31.0, temperature 0, at most 512 output tokens, `examples/evaluate/flashmap/bench_flashmap_vllm.sh` with 8 / 16 / 64 prompts at concurrency 1 / 4 / 16. Output throughput in tokens/s, with the mean acceptance length (accepted drafts plus one) in parentheses. FlashMap uses one jump and a 64k-token draft vocabulary; DFlash is `z-lab/Qwen3-8B-DFlash-b16` (15 drafts).
+
+| Dataset   | Concurrency | Target only | DFlash        | FlashMap      |
+| --------- | ----------- | ----------- | ------------- | ------------- |
+| GSM8K     | 1           | 84.5        | 298.9 (5.55)  | 393.0 (7.25)  |
+| GSM8K     | 4           | 288.8       | 1021.5 (5.90) | 1297.9 (7.33) |
+| GSM8K     | 16          | 1030.9      | 2048.9 (6.23) | 2482.5 (7.84) |
+| HumanEval | 1           | 84.4        | 384.7 (6.09)  | 383.6 (5.35)  |
+| HumanEval | 4           | 331.5       | 1247.2 (6.47) | 1107.8 (5.62) |
+| HumanEval | 16          | 1050.9      | 2053.3 (6.21) | 1827.4 (5.56) |
+| MT-Bench  | 1           | 84.4        | 247.8 (3.88)  | 296.0 (4.11)  |
+| MT-Bench  | 4           | 324.3       | 694.8 (3.59)  | 692.7 (3.56)  |
+| MT-Bench  | 16          | 1019.4      | 1090.1 (3.19) | 1107.3 (3.29) |
+
+At temperature 1 (drafts sampled, `"draft_sample_method": "probabilistic"`):
+
+| Dataset   | Concurrency | DFlash        | FlashMap      |
+| --------- | ----------- | ------------- | ------------- |
+| GSM8K     | 1           | 308.0 (4.75)  | 472.2 (6.63)  |
+| GSM8K     | 16          | 1683.2 (5.12) | 1985.1 (6.42) |
+| HumanEval | 1           | 298.6 (4.82)  | 345.8 (5.07)  |
+| HumanEval | 16          | 1709.7 (5.27) | 1621.7 (5.03) |
+| MT-Bench  | 1           | 207.8 (3.31)  | 260.4 (3.68)  |
+| MT-Bench  | 16          | 944.9 (2.77)  | 1008.8 (3.02) |
+
+A FlashMap draft step (GPU time, CUDA graphs) takes 1.59 / 2.01 / 3.78 ms at batch 1 / 4 / 16, against 2.65 / 3.13 / 7.01 ms for DFlash. Two jumps (`FLASHMAP_NUM_STEPS=2`, exact, with a vocabulary-sized state between the jumps) raise the acceptance length (GSM8K 7.68, HumanEval 6.31, MT-Bench 4.19 at concurrency 1) but cost 5.2 ms per draft step, so one jump is faster end to end on this GPU.
+
 ## Research & Citation
 
 FlashMap distills its drafter from a discrete flow following [Flow Map Language Models](https://arxiv.org/abs/2602.16813).

@@ -393,7 +393,14 @@ class FlashMapDraftModel(nn.Module):
             )
         self._cache_args = None
         if os.environ.get("FLASHMAP_COMPILE", "1") == "1":
-            self._compiled = torch.compile(self._dit, dynamic=True, fullgraph=True)
+            # FLASHMAP_COMPILE_MODE=max-autotune-no-cudagraphs lets inductor pick
+            # Triton GEMMs with fused epilogues (slower startup).
+            self._compiled = torch.compile(
+                self._dit,
+                dynamic=True,
+                fullgraph=True,
+                mode=os.environ.get("FLASHMAP_COMPILE_MODE") or None,
+            )
             self._compiled_noise = torch.compile(
                 self._noise_input, dynamic=True, fullgraph=True
             )

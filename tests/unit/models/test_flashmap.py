@@ -7,6 +7,7 @@ from speculators.config import SpeculatorsConfig, VerifierConfig
 from speculators.losses import resolve_loss_config
 from speculators.model import SpeculatorModel
 from speculators.models.flashmap import FlashMapDraftModel, FlashMapSpeculatorConfig
+from speculators.models.flashmap.config import DEFAULT_TIME_GRIDS
 from speculators.models.flashmap.schedule import DecodingErrorSchedule
 from speculators.proposals.greedy import GreedyTokenProposalConfig
 from speculators.train.config.schema import TrainConfig
@@ -103,11 +104,10 @@ def test_flashmap_trainer_kwargs_follow_the_cli():
     assert val_kwargs.keys() == train_kwargs.keys()
 
 
-def test_decoding_error_grid_matches_release():
-    grid = DecodingErrorSchedule(151936).grid(2, torch.device("cpu"))
-    assert grid[0] == 0.0
-    assert grid[-1] == 1.0
-    assert grid[1].item() == pytest.approx(0.8172569274902344, abs=1e-6)
+def test_decoding_error_grids_match_the_release():
+    schedule = DecodingErrorSchedule(151936)
+    for num_steps, expected in enumerate(DEFAULT_TIME_GRIDS, start=1):
+        assert schedule.grid(num_steps, torch.device("cpu")).tolist() == expected
 
 
 @pytest.mark.parametrize("attn_impl", ["sdpa", "eager"])

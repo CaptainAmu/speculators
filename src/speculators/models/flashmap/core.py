@@ -248,10 +248,16 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
         base = DFlashDraftModel._build_base_config_kwargs(  # noqa: SLF001
             "flashmap", dit_config, **{**kwargs, "sample_from_anchor": True}
         )
+        # The jump grids depend on the vocabulary through the schedule.
+        schedule = DecodingErrorSchedule(verifier_config.vocab_size)
         config = FlashMapSpeculatorConfig(
             **base,
             target_hidden_size=verifier_config.hidden_size,
             timestep_embed_dim=kwargs.get("timestep_embed_dim", 256),
+            time_grids=[
+                schedule.grid(num_steps, torch.device("cpu")).tolist()
+                for num_steps in range(1, 5)
+            ],
             flow_map=False,
         )
         model = cls(config=config)

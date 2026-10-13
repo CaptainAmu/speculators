@@ -1,6 +1,6 @@
-# FlashMap
+# Training FlashMap
 
-FlashMap is a block-parallel drafter, like [DFlash](dflash.md), whose block is drawn from a distilled discrete flow map: one network evaluation turns Gaussian noise into a whole block of `block_size` draft tokens. It is conditioned like DFlash -- the fused hidden states of the verifier's auxiliary layers before the anchor, plus the anchor token -- but drafts with a DiT denoiser over the vocabulary simplex instead of mask tokens. Taking two jumps instead of one is slower but more accurate, from the same weights.
+[FlashMap](flashmap.md) is a block-parallel drafter, like [DFlash](dflash.md), whose block is drawn from a distilled discrete flow map: one network evaluation turns Gaussian noise into a whole block of `block_size` draft tokens. It is conditioned like DFlash -- the fused hidden states of the verifier's auxiliary layers before the anchor, plus the anchor token -- but drafts with a DiT denoiser over the vocabulary simplex instead of mask tokens. Taking two jumps instead of one is slower but more accurate, from the same weights.
 
 ## How It Works
 
@@ -72,5 +72,6 @@ FlashMap distils the flow maps of [Flow Map Language Models](https://arxiv.org/a
 
 ## See Also
 
+- [FlashMap](flashmap.md) -- Serving a trained FlashMap drafter in vLLM
 - [DFlash](dflash.md) -- The block drafter whose conditioning and anchor sampling FlashMap shares
 - [Train a Speculator](../tutorials/train.md) -- Data generation and the online/offline training modes

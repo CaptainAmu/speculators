@@ -90,13 +90,15 @@ REQUIRED_FLAGS: dict[str, str] = _required_flags()
 
 # Algorithm group -> the speculator types that consume it. A group set to a
 # non-default value under a speculator_type absent from its set is ignored, and
-# warns. DFlash2, DSpark and XPress share the DFlash backbone group; their exclusive
-# architecture knobs remain in their own groups. eagle3 uses no group.
+# warns. DFlash2, DSpark, XPress and FlashMap share the DFlash backbone group;
+# their exclusive architecture knobs remain in their own groups. eagle3 uses no
+# group.
 _ALGORITHM_GROUP_USERS: dict[str, frozenset[str]] = {
-    "dflash": frozenset({"dflash", "dflash2", "dspark", "xpress"}),
+    "dflash": frozenset({"dflash", "dflash2", "dspark", "xpress", "flashmap"}),
     "dflash2": frozenset({"dflash2"}),
     "dspark": frozenset({"dspark"}),
     "xpress": frozenset({"xpress"}),
+    "flashmap": frozenset({"flashmap"}),
     "peagle": frozenset({"peagle"}),
     "mtp": frozenset({"mtp"}),
 }

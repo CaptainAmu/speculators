@@ -467,8 +467,10 @@ class DFlashArgs(_Group):
         description="Sample from the anchor position (all positions predict). "
         "Default: False for dflash/dflash2, True for dspark.",
     )
-    dflash_decay_gamma: float = Field(
-        default=4.0, description="Decay gamma for DFlash-family loss weighting."
+    dflash_decay_gamma: float | None = Field(
+        default=None,
+        description="Decay gamma for DFlash-family loss weighting "
+        "(default: 7 for flashmap, 4 otherwise).",
     )
     per_position_loss_weight: Literal["fixed-exp-decay", "dpace"] | None = Field(
         default=None,
@@ -583,6 +585,47 @@ class XPressArgs(_Group):
     )
 
 
+class FlashMapArgs(_Group):
+    """FlashMap: the DiT denoiser's shape (stage 1) and the flow map's semigroup
+    distillation from a trained flow (stage 2)."""
+
+    flashmap_teacher: str | None = Field(
+        default=None,
+        description="FlashMap stage 2: a trained stage-1 FlashMap flow (checkpoint "
+        "directory). The flow map is initialized from it, takes its architecture, and "
+        "is distilled from it with the semigroup objective. Unset: train the flow "
+        "(stage 1).",
+    )
+    dit_hidden_size: int = Field(
+        default=2048, description="FlashMap: width of the DiT denoiser (stage 1)."
+    )
+    dit_num_heads: int = Field(
+        default=16, description="FlashMap: attention heads of the DiT (stage 1)."
+    )
+    dit_cond_dim: int = Field(
+        default=256,
+        description="FlashMap: width of the DiT's time conditioning (stage 1).",
+    )
+    diagonal_fraction: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="FlashMap stage 2: fraction of blocks trained on the diagonal "
+        "against the frozen flow.",
+    )
+    boundary_prob: float = Field(
+        default=0.0625,
+        ge=0.0,
+        le=1.0,
+        description="FlashMap stage 2: fraction of the off-diagonal blocks trained "
+        "on the drafting jump (s, t) = (0, 1).",
+    )
+    antithetic_sampling: bool = Field(
+        default=True,
+        description="FlashMap stage 2: stratify the time draws over the batch.",
+    )
+
+
 class PEagleArgs(_Group):
     num_depths: int = Field(
         default=8,
@@ -623,6 +666,7 @@ _GROUPS: dict[str, type[_Group]] = {
     "dflash2": DFlash2Args,
     "dspark": DSparkArgs,
     "xpress": XPressArgs,
+    "flashmap": FlashMapArgs,
     "peagle": PEagleArgs,
     "mtp": MTPArgs,
 }
@@ -635,7 +679,10 @@ _DEFAULT_LOSS_FN: dict[str, str] = {
     "dflash": "ce",
     "xpress": '{"ce": 0.1, "tv": 0.9}',
 }
-_DEFAULT_BLOCK_SIZE: dict[str, int] = {"dflash": 16, "xpress": 16}
+_DEFAULT_BLOCK_SIZE: dict[str, int] = {"dflash": 16, "xpress": 16, "flashmap": 16}
+# FlashMap's 6-layer DiT and slot decay are the released recipe.
+_DEFAULT_NUM_LAYERS: dict[str, int] = {"flashmap": 6}
+_DEFAULT_DECAY_GAMMA: dict[str, float] = {"flashmap": 7.0}
 
 
 class TrainConfig(BaseSettings):
@@ -716,7 +763,7 @@ class TrainConfig(BaseSettings):
     speculator_type: str = Field(
         default="eagle3",
         description="Type of speculator model to train "
-        "(eagle3, dflash, dflash2, dspark, xpress, peagle, mtp).",
+        "(eagle3, dflash, dflash2, dspark, xpress, flashmap, peagle, mtp).",
     )
     dry_run: bool = Field(
         default=False,
@@ -744,6 +791,7 @@ class TrainConfig(BaseSettings):
     dflash2: DFlash2Args = Field(default_factory=DFlash2Args)
     dspark: DSparkArgs = Field(default_factory=DSparkArgs)
     xpress: XPressArgs = Field(default_factory=XPressArgs)
+    flashmap: FlashMapArgs = Field(default_factory=FlashMapArgs)
     peagle: PEagleArgs = Field(default_factory=PEagleArgs)
     mtp: MTPArgs = Field(default_factory=MTPArgs)
 
@@ -797,7 +845,9 @@ class TrainConfig(BaseSettings):
         if self.optimizer.muon_lr is None:
             self.optimizer.muon_lr = self.optimizer.lr
         if self.draft.num_layers is None:
-            self.draft.num_layers = 5 if is_dflash_family else 1
+            self.draft.num_layers = _DEFAULT_NUM_LAYERS.get(
+                self.speculator_type, 5 if is_dflash_family else 1
+            )
         if self.dflash.per_position_loss_weight is None:
             self.dflash.per_position_loss_weight = (
                 "dpace" if is_dflash else "fixed-exp-decay"
@@ -806,6 +856,10 @@ class TrainConfig(BaseSettings):
             self.loss.loss_fn = _DEFAULT_LOSS_FN.get(self.speculator_type, "kl_div")
         if self.dflash.block_size is None:
             self.dflash.block_size = _DEFAULT_BLOCK_SIZE.get(self.speculator_type, 8)
+        if self.dflash.dflash_decay_gamma is None:
+            self.dflash.dflash_decay_gamma = _DEFAULT_DECAY_GAMMA.get(
+                self.speculator_type, 4.0
+            )
         return self
 
     @model_validator(mode="after")

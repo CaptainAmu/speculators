@@ -11,6 +11,7 @@ def create_anchor_block_mask_mod(
     block_size: int,
     sliding_window: int | None = None,
     sliding_window_non_causal: bool = False,
+    kv_block_size: int | None = None,
 ):
     """
     Build a flex-attention mask mod where each query block corresponds to one anchor.
@@ -35,6 +36,8 @@ def create_anchor_block_mask_mod(
         block_size: number of query tokens per anchor block
         sliding_window: integer size of sliding window or None for full attn
         sliding_window_non_causal: Use non causal mask for sliding window attn
+        kv_block_size: number of synthetic KV tokens per anchor block, when it
+            differs from the query side (default: block_size)
 
     Returns:
         mask_mod, q_len, kv_len
@@ -51,8 +54,9 @@ def create_anchor_block_mask_mod(
         )
 
     n_anchors = anchor_positions.numel()
+    kv_block_size = block_size if kv_block_size is None else kv_block_size
     q_len = n_anchors * block_size
-    kv_len = total_seq_len + q_len
+    kv_len = total_seq_len + n_anchors * kv_block_size
 
     # For each query position, which anchor does it belong to?
     # query q in [j*block_size, (j+1)*block_size) belongs to anchor_positions[j]
@@ -90,7 +94,7 @@ def create_anchor_block_mask_mod(
         """
         q_block = q_idx // block_size
         kv_is_block = kv_idx >= total_seq_len
-        kv_block = (kv_idx - total_seq_len) // block_size
+        kv_block = (kv_idx - total_seq_len) // kv_block_size
 
         same = kv_is_block & (q_block == kv_block)
         if not non_causal:

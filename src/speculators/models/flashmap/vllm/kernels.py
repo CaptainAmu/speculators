@@ -57,7 +57,14 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
 
 @triton.jit
 def _rms_norm_rope_kernel(
-    x_ptr, weight_ptr, cos_sin_ptr, pos_ptr, out_ptr, eps, H: tl.constexpr, D: tl.constexpr
+    x_ptr,
+    weight_ptr,
+    cos_sin_ptr,
+    pos_ptr,
+    out_ptr,
+    eps,
+    H: tl.constexpr,
+    D: tl.constexpr,
 ):
     # One program per (token, head) of a contiguous (tokens, H, D) input.
     token = tl.program_id(0) // H
@@ -139,12 +146,12 @@ def _block_self_attention_kernel(
     k_even = tl.load(row + H * D + 2 * i).to(tl.float32)
     k_odd = tl.load(row + H * D + 2 * i + 1).to(tl.float32)
 
-    q_rms = tl.rsqrt(
-        (tl.sum(q_even * q_even, 1) + tl.sum(q_odd * q_odd, 1)) / D + eps
-    )[:, None]
-    k_rms = tl.rsqrt(
-        (tl.sum(k_even * k_even, 1) + tl.sum(k_odd * k_odd, 1)) / D + eps
-    )[:, None]
+    q_rms = tl.rsqrt((tl.sum(q_even * q_even, 1) + tl.sum(q_odd * q_odd, 1)) / D + eps)[
+        :, None
+    ]
+    k_rms = tl.rsqrt((tl.sum(k_even * k_even, 1) + tl.sum(k_odd * k_odd, 1)) / D + eps)[
+        :, None
+    ]
     qw_even = tl.load(q_norm_ptr + 2 * i).to(tl.float32)
     qw_odd = tl.load(q_norm_ptr + 2 * i + 1).to(tl.float32)
     kw_even = tl.load(k_norm_ptr + 2 * i).to(tl.float32)

@@ -35,11 +35,11 @@ from collections.abc import Iterable
 import torch
 import torch.nn.functional as F
 from torch import nn
-
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
+from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
 
 from speculators.models.flashmap.vllm.kernels import (
     block_self_attention,
@@ -68,8 +68,6 @@ def paged_cross_attention(
 ) -> torch.Tensor:
     """Non-causal FlashAttention of ``query (tokens, heads, head_dim)`` onto the
     first ``seqused_k`` cached positions of each request."""
-    from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
-
     head_dim = query.shape[-1]
     key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)
     return flash_attn_varlen_func(
@@ -258,7 +256,7 @@ class FlashMapDraftModel(nn.Module):
         return set(params)
 
     @torch.no_grad()
-    def prepare(self, embed_tokens: torch.Tensor, lm_head: torch.Tensor) -> None:
+    def prepare(self, embed_tokens: torch.Tensor, lm_head: torch.Tensor) -> None:  # noqa: C901
         """Precompute what the draft step needs from the target's embedding
         ``(vocab, hidden)`` and LM head and from the fixed jump times."""
         device = self.fc.weight.device
@@ -284,7 +282,11 @@ class FlashMapDraftModel(nn.Module):
             )
             per_layer = []
             for layer in self.layers:
-                for adaln in (layer.self_attn_adaln, layer.cross_attn_adaln, layer.mlp_adaln):
+                for adaln in (
+                    layer.self_attn_adaln,
+                    layer.cross_attn_adaln,
+                    layer.mlp_adaln,
+                ):
                     mod_scale, shift, gate = adaln(cond)
                     per_layer += [(1 + mod_scale), shift, gate]
             # (layers, 9, dim): (1 + scale, shift, gate) for self, cross, mlp.
@@ -292,7 +294,9 @@ class FlashMapDraftModel(nn.Module):
                 torch.cat(per_layer).view(len(self.layers), 9, -1).contiguous()
             )
             f_scale, f_shift, _ = self.final_adaln(cond)
-            self.final_modulations.append(torch.cat([1 + f_scale, f_shift]).contiguous())
+            self.final_modulations.append(
+                torch.cat([1 + f_scale, f_shift]).contiguous()
+            )
         gate = self.noise_gate.float()
         if self.config.noise_gate == "jump":
             self.noise_gates = [
@@ -310,11 +314,13 @@ class FlashMapDraftModel(nn.Module):
 
         # One-jump noise: x0 @ E ~ N(0, E^T E) = z @ A, A = sqrt(Lambda) Q^T.
         gram = torch.zeros(
-            embed_tokens.shape[1], embed_tokens.shape[1], device=device, dtype=torch.float32
+            embed_tokens.shape[1],
+            embed_tokens.shape[1],
+            device=device,
+            dtype=torch.float32,
         )
         for rows in embed_tokens.split(16384):
-            rows = rows.float()
-            gram += rows.T @ rows
+            gram += rows.float().T @ rows.float()
         eigvals, eigvecs = torch.linalg.eigh(gram.double())
         eigvals = eigvals.clamp_min(0)
         factor = eigvals.sqrt()[:, None] * eigvecs.T  # (hidden, hidden), A
@@ -330,7 +336,9 @@ class FlashMapDraftModel(nn.Module):
         # Context keys/values of every layer in one GEMM.
         self.context_kv_weight = torch.cat(
             [
-                torch.cat([layer.cross_attn.k_proj.weight, layer.cross_attn.v_proj.weight])
+                torch.cat(
+                    [layer.cross_attn.k_proj.weight, layer.cross_attn.v_proj.weight]
+                )
                 for layer in self.layers
             ]
         )
@@ -356,7 +364,9 @@ class FlashMapDraftModel(nn.Module):
                 layer.self_attn.k_proj,
                 layer.self_attn.v_proj,
             ):
-                proj.weight = nn.Parameter(proj.weight.new_empty(0), requires_grad=False)
+                proj.weight = nn.Parameter(
+                    proj.weight.new_empty(0), requires_grad=False
+                )
         self.cos_sin = rope_table(
             self.max_model_len + self.block_size + 1,
             self.head_dim,
@@ -369,7 +379,9 @@ class FlashMapDraftModel(nn.Module):
         # The DiT head folded into the LM head (no nonlinearity between them).
         self.hot_ids = None
         if self.d2t is not None:
-            self.hot_ids = torch.arange(self.d2t.shape[0], device=device) + self.d2t.data
+            self.hot_ids = (
+                torch.arange(self.d2t.shape[0], device=device) + self.d2t.data
+            )
         self.head_weight, self.head_bias = self._fold_head(lm_head, self.hot_ids)
         self.jump_head = None
         if self.num_steps > 1:
@@ -395,8 +407,9 @@ class FlashMapDraftModel(nn.Module):
 
     def _fold_head(self, lm_head: torch.Tensor, rows: torch.Tensor | None, chunk=8192):
         count = lm_head.shape[0] if rows is None else rows.numel()
-        weight = torch.empty(count, self.head.weight.shape[1], dtype=lm_head.dtype,
-                             device=lm_head.device)
+        weight = torch.empty(
+            count, self.head.weight.shape[1], dtype=lm_head.dtype, device=lm_head.device
+        )
         bias = torch.empty(count, dtype=lm_head.dtype, device=lm_head.device)
         head_weight, head_bias = self.head.weight.float(), self.head.bias.float()
         for start in range(0, count, chunk):
@@ -484,7 +497,11 @@ class FlashMapDraftModel(nn.Module):
     ) -> None:
         """``precompute_and_store_context_kv``, done by the next ``forward``
         together with its anchors."""
-        self._pending_context = (context_states, context_positions, context_slot_mapping)
+        self._pending_context = (
+            context_states,
+            context_positions,
+            context_slot_mapping,
+        )
 
     # ------------------------------------------------------------------ drafting
 
@@ -523,7 +540,9 @@ class FlashMapDraftModel(nn.Module):
             normed = F.layer_norm(hidden, (dim,), eps=self.config.adaln_eps)
             normed = normed * mods[3] + mods[4]
             query = rms_norm_rope(
-                F.linear(normed, cross_attn.q_proj.weight).view(tokens, heads, head_dim),
+                F.linear(normed, cross_attn.q_proj.weight).view(
+                    tokens, heads, head_dim
+                ),
                 cross_attn.q_norm.weight,
                 self.cos_sin,
                 positions,
@@ -561,8 +580,9 @@ class FlashMapDraftModel(nn.Module):
     def _first_jump_input(self, tokens: int, device) -> torch.Tensor:
         """``x_embed(embed_state(x0, 0, t_1))`` for fresh noise, drawn in the
         embedding's eigenbasis (see the module docstring)."""
-        z = torch.randn(tokens, self.noise_embed.shape[1], device=device,
-                        dtype=torch.float32)
+        z = torch.randn(
+            tokens, self.noise_embed.shape[1], device=device, dtype=torch.float32
+        )
         return (self._compiled_noise or self._noise_input)(z)
 
     def _noise_input(self, z: torch.Tensor) -> torch.Tensor:
@@ -570,9 +590,10 @@ class FlashMapDraftModel(nn.Module):
             z = z * self.noise_scale
         rms = torch.rsqrt((z * z) @ self.noise_eigvals + self.noise_norm.eps)
         noise = F.linear(z.to(self.dtype), self.noise_embed)
-        return self.first_hidden + (self.noise_gates[0] * rms)[:, None].to(
-            self.dtype
-        ) * noise
+        return (
+            self.first_hidden
+            + (self.noise_gates[0] * rms)[:, None].to(self.dtype) * noise
+        )
 
     def _embed_state(self, state: torch.Tensor, step: int) -> torch.Tensor:
         """``x_embed(embed_state(state, s, t))`` of a vocabulary-sized float32
@@ -592,7 +613,7 @@ class FlashMapDraftModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        inputs_embeds: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,  # noqa: ARG002
     ) -> torch.Tensor:
         tokens = input_ids.shape[0]
         blocks = tokens // self.block_size

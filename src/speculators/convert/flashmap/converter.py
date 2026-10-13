@@ -42,15 +42,21 @@ __all__ = ["FlashMapConverter", "deepspec_to_canonical"]
 _VERIFIER_KEYS = frozenset({"embed_tokens.weight", "lm_head.weight"})
 
 
-def deepspec_to_canonical(weights: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+def deepspec_to_canonical(  # noqa: C901
+    weights: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
     """Rename a DeepSpec flow-map state dict to the canonical FlashMap names."""
     out: dict[str, torch.Tensor] = {}
     sub = {"self_attn": "self_attn", "cross_attn": "cross_attn"}
-    adaln = {"adaln_self": "self_attn_adaln", "adaln_cross": "cross_attn_adaln",
-             "adaln_mlp": "mlp_adaln"}
-    for name, tensor in weights.items():
-        if name in _VERIFIER_KEYS:
+    adaln = {
+        "adaln_self": "self_attn_adaln",
+        "adaln_cross": "cross_attn_adaln",
+        "adaln_mlp": "mlp_adaln",
+    }
+    for source_name, source_tensor in weights.items():
+        if source_name in _VERIFIER_KEYS:
             continue
+        name, tensor = source_name, source_tensor
         if name.endswith(".scale"):
             # DeepSpec RMSNorm multiplies by (1 + scale), formed in bf16.
             tensor = 1 + tensor
@@ -151,7 +157,9 @@ class FlashMapConverter:
                 f"checkpoint was trained on hidden size {target_hidden}, but "
                 f"{base_model} has {verifier_config['hidden_size']}"
             )
-        num_layers = 1 + max(int(k.split(".")[1]) for k in weights if k.startswith("layers."))
+        num_layers = 1 + max(
+            int(k.split(".")[1]) for k in weights if k.startswith("layers.")
+        )
         head_dim = weights["layers.0.self_attn.q_norm.weight"].shape[0]
         intermediate = weights["layers.0.mlp.fc1.weight"].shape[0]
         cond_dim = weights["time_embed.linear_1.weight"].shape[0]
@@ -212,7 +220,9 @@ class FlashMapConverter:
             target_hidden_size=target_hidden,
             aux_hidden_state_layer_ids=aux_layer_ids,
             timestep_embed_dim=cond_dim,
-            time_scale=float(source.get("dit_time_scale", source.get("time_scale", 1000.0))),
+            time_scale=float(
+                source.get("dit_time_scale", source.get("time_scale", 1000.0))
+            ),
             qk_norm_eps=float(source.get("qk_norm_eps", 1e-5)),
             adaln_eps=float(source.get("layer_norm_eps", 1e-6)),
             noise_gate=source.get("noise_gate", "jump"),
@@ -242,17 +252,33 @@ class FlashMapConverter:
         config = FlashMapSpeculatorConfig.from_pretrained(str(output_path))
         num_layers = config.transformer_layer_config.num_hidden_layers
         expected = {
-            "fc.weight", "hidden_norm.weight", "anchor_proj.weight",
-            "anchor_proj.bias", "anchor_norm.weight", "state_norm.weight",
-            "noise_norm.weight", "noise_gate", "x_embed.weight", "x_embed.bias",
-            "head.weight", "head.bias", "final_adaln.linear.weight",
+            "fc.weight",
+            "hidden_norm.weight",
+            "anchor_proj.weight",
+            "anchor_proj.bias",
+            "anchor_norm.weight",
+            "state_norm.weight",
+            "noise_norm.weight",
+            "noise_gate",
+            "x_embed.weight",
+            "x_embed.bias",
+            "head.weight",
+            "head.bias",
+            "final_adaln.linear.weight",
             "final_adaln.linear.bias",
         }
         for i in range(num_layers):
             for attn in ("self_attn", "cross_attn"):
                 expected |= {
                     f"layers.{i}.{attn}.{p}.weight"
-                    for p in ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm")
+                    for p in (
+                        "q_proj",
+                        "k_proj",
+                        "v_proj",
+                        "o_proj",
+                        "q_norm",
+                        "k_norm",
+                    )
                 }
         missing = expected - set(weights)
         if missing:

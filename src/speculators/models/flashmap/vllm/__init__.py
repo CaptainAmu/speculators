@@ -22,10 +22,14 @@ DFlash-family speculator (FlashMap, DFlash, DSpark) to ``<file>`` as JSON lines
 import json
 import os
 import sys
+from pathlib import Path
 
 __all__ = ["FLASHMAP_ARCHITECTURE", "register"]
 
 FLASHMAP_ARCHITECTURE = "FlashMapDraftModel"
+
+# Draft steps timed between flushes of FLASHMAP_STEP_TIMING.
+_TIMING_FLUSH = 256
 
 # Speculators config fields the vLLM draft config carries over.
 _FLASHMAP_FIELDS = (
@@ -99,9 +103,9 @@ def _time_draft_steps(path: str) -> None:
         result = propose(self, input_batch, *args, **kwargs)
         end.record()
         pending.append((input_batch.num_reqs, start, end))
-        if len(pending) >= 256:
+        if len(pending) >= _TIMING_FLUSH:
             end.synchronize()
-            with open(path, "a") as f:
+            with Path(path).open("a") as f:
                 for reqs, s, e in pending:
                     f.write(json.dumps({"reqs": reqs, "ms": s.elapsed_time(e)}) + "\n")
             pending.clear()

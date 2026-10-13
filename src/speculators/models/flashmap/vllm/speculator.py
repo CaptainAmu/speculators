@@ -9,9 +9,9 @@ sampling, which reads logits off the folded head over the draft vocabulary.
 """
 
 import torch
-import torch.nn as nn
-
-from vllm.config import VllmConfig
+from torch import nn
+from vllm.compilation.backends import set_model_tag
+from vllm.config import VllmConfig, replace
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.model_loader.utils import get_draft_load_config
@@ -38,11 +38,8 @@ class FlashMapSpeculator(DFlashSpeculator):
     def load_draft_model(
         self,
         target_model: nn.Module,
-        target_attn_layer_names: set[str],
+        target_attn_layer_names: set[str],  # noqa: ARG002
     ) -> nn.Module:
-        from vllm.compilation.backends import set_model_tag
-        from vllm.config import replace
-
         speculative_config = self.speculative_config
         draft_vllm_config = replace(
             self.vllm_config,

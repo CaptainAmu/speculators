@@ -32,7 +32,7 @@ _COUNTERS = (
 
 
 def write_prompts(src: str, dst: str) -> None:
-    with open(src) as f_in, open(dst, "w") as f_out:
+    with Path(src).open() as f_in, Path(dst).open("w") as f_out:
         for line in f_in:
             row = json.loads(line)
             prompt = row.get("prompt") or row["conversations"][0]["content"]
@@ -75,8 +75,17 @@ def table(directory: str) -> None:
                 result.get("completed", 0),
             )
         )
-    header = ("server", "dataset", "conc", "out tok/s", "TPOT ms", "ITL ms",
-              "TTFT ms", "accept len", "reqs")
+    header = (
+        "server",
+        "dataset",
+        "conc",
+        "out tok/s",
+        "TPOT ms",
+        "ITL ms",
+        "TTFT ms",
+        "accept len",
+        "reqs",
+    )
     print("| " + " | ".join(header) + " |")
     print("|" + "---|" * len(header))
     for row in sorted(rows, key=lambda r: (r[1], r[2], r[0])):
@@ -119,11 +128,15 @@ def compare(directory: str, baseline: str = "target") -> None:
             same = sum(a == b for a, b in pairs)
             prefix = []
             for a, b in pairs:
-                n = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
+                n = next(
+                    (i for i, (x, y) in enumerate(zip(a, b)) if x != y),
+                    min(len(a), len(b)),
+                )
                 prefix.append(n / max(len(a), 1))
             dataset, conc = rest.rsplit("_c", 1)
             mean_prefix = sum(prefix) / max(len(prefix), 1)
-            print(f"| {label} | {dataset} | {conc} | {same}/{len(pairs)} | {mean_prefix:.3f} |")
+            identical = f"{same}/{len(pairs)}"
+            print(f"| {label} | {dataset} | {conc} | {identical} | {mean_prefix:.3f} |")
 
 
 if __name__ == "__main__":

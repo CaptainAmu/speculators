@@ -110,7 +110,8 @@ def convert(
         speculators convert ./FlashMap-Qwen3-8B \\
             --algorithm flashmap \\
             --verifier "Qwen/Qwen3-8B" \\
-            --algorithm-kwargs '{"draft_vocab_size": 65536, "draft_vocab_file": "ranking.safetensors"}'
+            --algorithm-kwargs \\
+            '{"draft_vocab_size": 65536, "draft_vocab_file": "ranking.safetensors"}'
     """
     if not algorithm_kwargs:
         algorithm_kwargs = {}

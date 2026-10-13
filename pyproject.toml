@@ -266,6 +266,14 @@ select = [
     "S108", # allow probable insecure usage of temporary files in tests
     "PLW2901", # allow variable overwrite in tests
 ]
+"src/speculators/models/flashmap/vllm/*.py" = [
+    "N803", # Triton kernels take their constexpr sizes in capitals
+    "N806", # Triton kernels name constexpr sizes in capitals
+    "N812", # torch.nn.functional as F, as vLLM model code imports it
+    "ARG001", # custom-op fake implementations mirror the real signature
+    "S101", # asserts state kernel and cache-layout preconditions
+    "PT018", # compound preconditions in one assert
+]
 "src/speculators/convert/**/*.py" = [
     "BLE001", # allow catching Exception for conversion errors
 ]

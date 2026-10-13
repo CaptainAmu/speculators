@@ -42,10 +42,10 @@ vllm serve Qwen/Qwen3-8B \
 
 For sampling at temperature > 0, add `"draft_sample_method": "probabilistic"` to the speculative config so that drafts are sampled from FlashMap's distribution and verified against it (with the default `greedy` draft sampling verification is still exact, but accepts less).
 
-| Environment variable   | Default            | Description                                            |
-| ---------------------- | ------------------ | ------------------------------------------------------ |
-| `FLASHMAP_NUM_STEPS`   | config `num_steps` | Jumps per draft block (1 is fastest)                   |
-| `FLASHMAP_COMPILE`     | `1`                | torch.compile the DiT (fuses its elementwise chains)   |
+| Environment variable | Default            | Description                                          |
+| -------------------- | ------------------ | ---------------------------------------------------- |
+| `FLASHMAP_NUM_STEPS` | config `num_steps` | Jumps per draft block (1 is fastest)                 |
+| `FLASHMAP_COMPILE`   | `1`                | torch.compile the DiT (fuses its elementwise chains) |
 
 ### Restricted Draft Vocabulary
 

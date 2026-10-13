@@ -118,6 +118,8 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
         self.verifier_lm_head = self.lm_head
 
         hidden_size = config.target_hidden_size
+        if hidden_size is None:
+            raise ValueError("FlashMap needs the verifier's target_hidden_size.")
         dit_size = tl_config.hidden_size
         cond_dim = config.timestep_embed_dim
         norm_eps = tl_config.rms_norm_eps
@@ -288,7 +290,7 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
                 "--flashmap-teacher must point at a stage-1 FlashMap flow "
                 "(flow_map=false), not at a flow map."
             )
-        config = copy.deepcopy(teacher.config)
+        config: FlashMapSpeculatorConfig = copy.deepcopy(teacher.config)  # type: ignore[assignment]
         config.flow_map = True
         if draft_attn_impl is not None:
             config.transformer_layer_config._attn_implementation = draft_attn_impl  # noqa: SLF001
@@ -349,7 +351,7 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
         posterior = (state.float() * evidence).softmax(dim=-1)
         embedded = self.state_norm(posterior.to(weight.dtype) @ weight)
         if self.config.flow_map and end is not None:
-            gate = self.noise_gate
+            gate: torch.Tensor = self.noise_gate
             if self.config.noise_gate == "jump":
                 gate = gate * (end - times)
             gate = gate.unsqueeze(-1)
@@ -379,7 +381,10 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
             [position_ids, position_ids[:, anchor_positions]], dim=1
         )
         rope = rope_cos_sin(context_position_ids, self.head_dim, self.rope_theta)
-        return [layer.cross_attn.project_kv(context, rope) for layer in self.layers]
+        return [
+            layer.cross_attn.project_kv(context, rope)  # type: ignore[union-attr,operator]
+            for layer in self.layers
+        ]
 
     def denoise(
         self,
@@ -594,7 +599,7 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
             )
         teacher = self._teacher[0]
         if teacher.fc.weight.device != input_ids.device:
-            teacher.to(input_ids.device)
+            teacher.to(input_ids.device)  # type: ignore[arg-type]
         num_blocks = blocks.anchor_positions.numel()
         kind, s, u, t = self._sample_semigroup_times(
             num_blocks,

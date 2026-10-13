@@ -176,17 +176,17 @@ class FlashMapDiTLayer(GradientCheckpointingLayer):
         hidden_size: int,
         num_heads: int,
         cond_dim: int,
-        mlp_ratio: float = 4.0,
-        norm_eps: float = 1e-6,
+        intermediate_size: int,
+        adaln_eps: float = 1e-6,
         qk_norm_eps: float = 1e-5,
     ):
         super().__init__()
-        self.self_attn_adaln = FlashMapAdaLNZero(hidden_size, cond_dim, norm_eps)
+        self.self_attn_adaln = FlashMapAdaLNZero(hidden_size, cond_dim, adaln_eps)
         self.self_attn = FlashMapAttention(hidden_size, num_heads, eps=qk_norm_eps)
-        self.cross_attn_adaln = FlashMapAdaLNZero(hidden_size, cond_dim, norm_eps)
+        self.cross_attn_adaln = FlashMapAdaLNZero(hidden_size, cond_dim, adaln_eps)
         self.cross_attn = FlashMapAttention(hidden_size, num_heads, eps=qk_norm_eps)
-        self.mlp_adaln = FlashMapAdaLNZero(hidden_size, cond_dim, norm_eps)
-        self.mlp = FlashMapMLP(hidden_size, int(mlp_ratio * hidden_size))
+        self.mlp_adaln = FlashMapAdaLNZero(hidden_size, cond_dim, adaln_eps)
+        self.mlp = FlashMapMLP(hidden_size, intermediate_size)
 
     def forward(
         self,

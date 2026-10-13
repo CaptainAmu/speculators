@@ -602,9 +602,10 @@ class FlashMapArgs(_Group):
     dit_num_heads: int = Field(
         default=16, description="FlashMap: attention heads of the DiT (stage 1)."
     )
-    dit_cond_dim: int = Field(
+    timestep_embed_dim: int = Field(
         default=256,
-        description="FlashMap: width of the DiT's time conditioning (stage 1).",
+        description="FlashMap: width of the DiT's time embedding and AdaLN "
+        "condition (stage 1).",
     )
     diagonal_fraction: float = Field(
         default=0.5,

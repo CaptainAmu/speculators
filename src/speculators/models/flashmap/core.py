@@ -1,5 +1,6 @@
 import copy
 import logging
+from types import SimpleNamespace
 from typing import ClassVar, NamedTuple
 
 import torch
@@ -7,7 +8,7 @@ from torch import nn
 from torch.nn.attention.flex_attention import create_mask
 from transformers import PretrainedConfig
 from transformers import initialization as init
-from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
+from transformers.models.qwen3.modeling_qwen3 import Qwen3Config, Qwen3RMSNorm
 
 from speculators.losses import LossConfig, resolve_loss_config
 from speculators.model import DraftVocabMixin, SpeculatorModel
@@ -98,7 +99,16 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
             tl_config._attn_implementation = "simple_flex_attention"  # noqa: SLF001
         self._attn_impl = tl_config._attn_implementation  # noqa: SLF001
         super().__init__(config=config)
-        self._init_vocab(config)
+        # DraftVocabMixin sizes the frozen verifier matrices from
+        # transformer_layer_config, which here describes the DiT.
+        verifier_dims = copy.copy(tl_config)
+        verifier_dims.hidden_size = config.target_hidden_size
+        self._init_vocab(
+            SimpleNamespace(
+                transformer_layer_config=verifier_dims,
+                draft_vocab_size=config.draft_vocab_size,
+            )
+        )
         if self.use_draft_vocab:
             raise NotImplementedError(
                 "FlashMap trains over the verifier's full vocabulary; omit "
@@ -107,52 +117,62 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
         # The frozen verifier lm_head and the draft lm_head are the same matrix.
         self.verifier_lm_head = self.lm_head
 
-        hidden_size = tl_config.hidden_size
-        dit_size = config.dit_hidden_size
-        cond_dim = config.dit_cond_dim
+        hidden_size = config.target_hidden_size
+        dit_size = tl_config.hidden_size
+        cond_dim = config.timestep_embed_dim
+        norm_eps = tl_config.rms_norm_eps
         self.block_size = config.block_size
-        self.head_dim = dit_size // config.dit_num_heads
+        self.head_dim = dit_size // tl_config.num_attention_heads
+        self.rope_theta = float(
+            (getattr(tl_config, "rope_parameters", None) or {}).get(
+                "rope_theta", getattr(tl_config, "rope_theta", 10000.0)
+            )
+        )
 
         # Context: fused auxiliary hidden states, and the anchor token.
         self.fc = nn.Linear(len(self.target_layer_ids) * hidden_size, dit_size, bias=False)
-        self.hidden_norm = Qwen3RMSNorm(dit_size, eps=config.norm_eps)
+        self.hidden_norm = Qwen3RMSNorm(dit_size, eps=norm_eps)
         self.anchor_proj = nn.Linear(hidden_size, dit_size)
-        self.anchor_norm = Qwen3RMSNorm(dit_size, eps=config.norm_eps)
+        self.anchor_norm = Qwen3RMSNorm(dit_size, eps=norm_eps)
         # The state is read through the verifier embedding (see embed_state).
-        self.state_norm = Qwen3RMSNorm(hidden_size, eps=config.norm_eps)
+        self.state_norm = Qwen3RMSNorm(hidden_size, eps=norm_eps)
         if config.flow_map:
-            self.noise_norm = Qwen3RMSNorm(hidden_size, eps=config.norm_eps)
-            self.register_buffer("noise_gate", torch.ones(1))
+            self.noise_norm = Qwen3RMSNorm(hidden_size, eps=norm_eps)
+            if config.noise_gate == "jump":
+                # The released recipe: the weight fixed at 1, times the jump.
+                self.register_buffer("noise_gate", torch.ones(1))
+            else:
+                # Starts shut, so a map initialized from its flow is the flow.
+                self.noise_gate = nn.Parameter(torch.zeros(1))
 
         # The DiT denoiser.
         self.x_embed = nn.Linear(hidden_size, dit_size)
-        self.time_embed = FlashMapTimestepEmbedding(cond_dim)
+        self.time_embed = FlashMapTimestepEmbedding(cond_dim, cond_dim)
         if config.flow_map:
             # Zero output: a map initialized from its flow starts as the flow.
-            self.jump_embed = FlashMapTimestepEmbedding(cond_dim)
+            self.jump_embed = FlashMapTimestepEmbedding(cond_dim, cond_dim)
             self.jump_embed.linear_2._flashmap_zero_init = True  # type: ignore[assignment]
         self.layers = nn.ModuleList(
             [
                 FlashMapDiTLayer(
                     dit_size,
-                    config.dit_num_heads,
+                    tl_config.num_attention_heads,
                     cond_dim,
-                    mlp_ratio=config.dit_mlp_ratio,
-                    norm_eps=config.norm_eps,
+                    intermediate_size=tl_config.intermediate_size,
+                    adaln_eps=config.adaln_eps,
                     qk_norm_eps=config.qk_norm_eps,
                 )
                 for _ in range(tl_config.num_hidden_layers)
             ]
         )
-        self.final_adaln = FlashMapAdaLNZero(dit_size, cond_dim, config.norm_eps)
+        self.final_adaln = FlashMapAdaLNZero(dit_size, cond_dim, config.adaln_eps)
         # Zero output: start from a uniform distribution over tokens.
         self.head = nn.Linear(dit_size, hidden_size)
         self.head._flashmap_zero_init = True  # type: ignore[assignment]
 
         # Only for validation metrics: the verifier's own greedy tokens.
         self.verifier_norm = resolve_verifier_norm_class(config)(
-            hidden_size,
-            eps=tl_config.rms_norm_eps,  # type: ignore[arg-type]
+            hidden_size, eps=norm_eps
         )
         self.verifier_norm.weight.requires_grad = False
 
@@ -204,15 +224,32 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
                 draft_attn_impl=kwargs.get("draft_attn_impl"),
             )
 
+        # transformer_layer_config describes the DiT; the verifier's hidden size
+        # is target_hidden_size.
+        dit_size = kwargs.get("dit_hidden_size", 2048)
+        num_heads = kwargs.get("dit_num_heads", 16)
+        dit_config = Qwen3Config(
+            vocab_size=verifier_config.vocab_size,
+            hidden_size=dit_size,
+            intermediate_size=4 * dit_size,
+            num_hidden_layers=verifier_config.num_hidden_layers,
+            num_attention_heads=num_heads,
+            num_key_value_heads=num_heads,
+            head_dim=dit_size // num_heads,
+            hidden_act="gelu",
+            rms_norm_eps=1e-6,
+            max_position_embeddings=verifier_config.max_position_embeddings,
+            rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+            tie_word_embeddings=False,
+        )
         # Every slot is a draft token, so a block proposes block_size tokens.
         base = DFlashDraftModel._build_base_config_kwargs(  # noqa: SLF001
-            "flashmap", verifier_config, **{**kwargs, "sample_from_anchor": True}
+            "flashmap", dit_config, **{**kwargs, "sample_from_anchor": True}
         )
         config = FlashMapSpeculatorConfig(
             **base,
-            dit_hidden_size=kwargs.get("dit_hidden_size", 2048),
-            dit_num_heads=kwargs.get("dit_num_heads", 16),
-            dit_cond_dim=kwargs.get("dit_cond_dim", 256),
+            target_hidden_size=verifier_config.hidden_size,
+            timestep_embed_dim=kwargs.get("timestep_embed_dim", 256),
             flow_map=False,
         )
         model = cls(config=config)
@@ -304,7 +341,10 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
         posterior = (state.float() * evidence).softmax(dim=-1)
         embedded = self.state_norm(posterior.to(weight.dtype) @ weight)
         if self.config.flow_map and end is not None:
-            gate = (self.noise_gate * (end - times)).unsqueeze(-1)
+            gate = self.noise_gate
+            if self.config.noise_gate == "jump":
+                gate = gate * (end - times)
+            gate = gate.unsqueeze(-1)
             noise = self.noise_norm(state.to(weight.dtype) @ weight)
             embedded = embedded + gate.to(embedded.dtype) * noise
         return embedded
@@ -330,7 +370,7 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
         context_position_ids = torch.cat(
             [position_ids, position_ids[:, anchor_positions]], dim=1
         )
-        rope = rope_cos_sin(context_position_ids, self.head_dim, self.config.rope_theta)
+        rope = rope_cos_sin(context_position_ids, self.head_dim, self.rope_theta)
         return [layer.cross_attn.project_kv(context, rope) for layer in self.layers]
 
     def denoise(
@@ -348,7 +388,7 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
         cond = self.time_embed(times * scale)
         if end is not None:
             cond = cond + self.jump_embed(end * scale)
-        rope = rope_cos_sin(position_ids, self.head_dim, self.config.rope_theta)
+        rope = rope_cos_sin(position_ids, self.head_dim, self.rope_theta)
         hidden = self.x_embed(self.embed_state(state, times, end))
         for layer, (ctx_keys, ctx_values) in zip(self.layers, ctx_kv, strict=True):
             hidden = layer(

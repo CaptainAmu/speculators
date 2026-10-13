@@ -16,24 +16,26 @@ EAGER_KL = resolve_loss_config("kl_div", "eager")
 
 
 def _tiny_flow(attn_impl: str = "sdpa") -> FlashMapDraftModel:
-    tl_config = Qwen3Config(
-        hidden_size=HIDDEN,
-        intermediate_size=32,
+    # transformer_layer_config describes the DiT; target_hidden_size the verifier.
+    dit_config = Qwen3Config(
+        hidden_size=32,
+        intermediate_size=128,
         num_hidden_layers=2,
-        num_attention_heads=2,
-        num_key_value_heads=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
         head_dim=8,
+        hidden_act="gelu",
         vocab_size=VOCAB,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
         _attn_implementation=attn_impl,  # type: ignore[call-arg]
     )
     config = FlashMapSpeculatorConfig(
-        transformer_layer_config=tl_config,
+        transformer_layer_config=dit_config,
+        target_hidden_size=HIDDEN,
         draft_vocab_size=VOCAB,
         block_size=BLOCK,
         aux_hidden_state_layer_ids=[0, 1],
-        dit_hidden_size=32,
-        dit_num_heads=4,
-        dit_cond_dim=16,
+        timestep_embed_dim=16,
         flow_map=False,
         speculators_config=SpeculatorsConfig(
             algorithm="flashmap",

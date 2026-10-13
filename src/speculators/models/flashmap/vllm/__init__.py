@@ -13,8 +13,14 @@ teaches vLLM three things without patching its source:
 
 Serve with ``vllm serve <speculators checkpoint>``, or pass the checkpoint as
 ``--speculative-config '{"model": "<checkpoint>", "method": "dflash"}'``.
+
+``FLASHMAP_STEP_TIMING=<file>`` appends the GPU time of every draft step of any
+DFlash-family speculator (FlashMap, DFlash, DSpark) to ``<file>`` as JSON lines
+``{"reqs": <batch size>, "ms": <time>}``, timed with CUDA events.
 """
 
+import json
+import os
 import sys
 
 __all__ = ["FLASHMAP_ARCHITECTURE", "register"]
@@ -73,6 +79,38 @@ def _init_speculator(init_speculator):
     return init_flashmap_or_other
 
 
+def _time_draft_steps(path: str) -> None:
+    import torch  # noqa: PLC0415
+    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (  # noqa: PLC0415
+        DFlashSpeculator,
+    )
+
+    propose = DFlashSpeculator.propose
+    if getattr(propose, "flashmap_timed", False):
+        return
+    pending: list = []
+
+    def timed_propose(self, input_batch, *args, **kwargs):
+        if kwargs.get("dummy_run") or torch.cuda.is_current_stream_capturing():
+            return propose(self, input_batch, *args, **kwargs)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        result = propose(self, input_batch, *args, **kwargs)
+        end.record()
+        pending.append((input_batch.num_reqs, start, end))
+        if len(pending) >= 256:
+            end.synchronize()
+            with open(path, "a") as f:
+                for reqs, s, e in pending:
+                    f.write(json.dumps({"reqs": reqs, "ms": s.elapsed_time(e)}) + "\n")
+            pending.clear()
+        return result
+
+    timed_propose.flashmap_timed = True  # type: ignore[attr-defined]
+    DFlashSpeculator.propose = timed_propose  # type: ignore[method-assign]
+
+
 def register() -> None:
     """vLLM general plugin entry point (idempotent)."""
     from vllm import ModelRegistry  # noqa: PLC0415
@@ -111,3 +149,6 @@ def register() -> None:
     runner = sys.modules.get("vllm.v1.worker.gpu.model_runner")
     if runner is not None and not getattr(runner.init_speculator, "flashmap", False):
         runner.init_speculator = spec_decode.init_speculator
+
+    if os.environ.get("FLASHMAP_STEP_TIMING"):
+        _time_draft_steps(os.environ["FLASHMAP_STEP_TIMING"])

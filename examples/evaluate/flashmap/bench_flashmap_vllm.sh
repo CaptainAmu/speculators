@@ -18,6 +18,9 @@
 # SERVERS entries are <label>=none | <label>=<method>:<draft>[:<env>=<value>...],
 #   <method> one of dflash, flashmap. Trailing <env>=<value> pairs are exported
 #   for that server only, e.g. fm2=flashmap:./FlashMap-Qwen3-8B:FLASHMAP_NUM_STEPS=2.
+# Requests sample at TEMPERATURE with no top-k/top-p (--generation-config vllm
+#   ignores the model's sampling defaults); above 0, drafts are sampled too
+#   ("draft_sample_method": "probabilistic").
 # PROMPT_DIR holds <dataset>.jsonl files of chat-templated prompts, either one
 #   {"prompt": ...} per line or DeepSpec's {"conversations": [{"content": ...}]}.
 # Optional: TEMPERATURE (0), MAX_TOKENS (1024), PROMPTS_PER_STREAM (8) and
@@ -41,6 +44,7 @@ GPU_UTIL="${GPU_UTIL:-0.85}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 PORT="${PORT:-8123}"
 EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:-}"
+NUM_SPEC="${NUM_SPEC:-16}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "$OUT/prompts"
@@ -56,7 +60,7 @@ run_server() {
     local label="$1" spec="$2"
     local -a args=(serve "$TARGET" --port "$PORT" --max-model-len "$MAX_MODEL_LEN"
         --gpu-memory-utilization "$GPU_UTIL" --no-enable-prefix-caching
-        --max-num-seqs 64)
+        --max-num-seqs 64 --generation-config vllm)
     local -a envs=()
     if [[ "$spec" != "none" ]]; then
         IFS=: read -r -a parts <<< "$spec"
@@ -64,6 +68,10 @@ run_server() {
         envs=("${parts[@]:2}")
         local vllm_method="dflash"  # FlashMap runs on vLLM's DFlash runtime
         local spec_json="{\"model\": \"$draft\", \"method\": \"$vllm_method\""
+        # A FlashMap block is all drafts; a DFlash block's first slot is the anchor.
+        local num_spec=$NUM_SPEC
+        [[ "$method" == "dflash" ]] && num_spec=$(( NUM_SPEC - 1 ))
+        spec_json+=", \"num_speculative_tokens\": $num_spec"
         if [[ "$TEMPERATURE" != "0" ]]; then
             spec_json+=", \"draft_sample_method\": \"probabilistic\""
         fi
@@ -71,7 +79,8 @@ run_server() {
         args+=(--speculative-config "$spec_json")
     fi
     # shellcheck disable=SC2086
-    env "${envs[@]}" vllm "${args[@]}" $EXTRA_SERVE_ARGS > "$OUT/$label.server.log" 2>&1 &
+    env FLASHMAP_STEP_TIMING="$OUT/$label.steps.jsonl" "${envs[@]}" \
+        vllm "${args[@]}" $EXTRA_SERVE_ARGS > "$OUT/$label.server.log" 2>&1 &
     SERVER_PID=$!
     until curl -sf "http://localhost:$PORT/health" > /dev/null 2>&1; do
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -87,6 +96,7 @@ stop_server() {
     wait "$SERVER_PID" 2>/dev/null || true
 }
 trap stop_server EXIT
+trap "exit 130" TERM INT
 
 for entry in $SERVERS; do
     label="${entry%%=*}"
@@ -104,7 +114,7 @@ for entry in $SERVERS; do
                 --skip-chat-template --custom-output-len "$MAX_TOKENS" \
                 --num-prompts "$prompts" --max-concurrency "$conc" \
                 --temperature "$TEMPERATURE" --request-rate inf \
-                --save-result --result-dir "$OUT" --result-filename "$name.json" \
+                --save-result --save-detailed --result-dir "$OUT" --result-filename "$name.json" \
                 > "$OUT/$name.log" 2>&1 || echo "bench $name failed" >&2
             curl -s "http://localhost:$PORT/metrics" > "$OUT/$name.metrics_after.txt"
         done
@@ -113,3 +123,5 @@ for entry in $SERVERS; do
 done
 
 python "$HERE/summarize_bench.py" table "$OUT"
+python "$HERE/summarize_bench.py" steps "$OUT"
+python "$HERE/summarize_bench.py" compare "$OUT"

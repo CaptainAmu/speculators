@@ -4,6 +4,15 @@
 ``{"prompt": ...}`` per line) from chat-templated prompts, given either the same
 way or as DeepSpec's ``{"conversations": [{"content": ...}, ...]}``.
 
+``steps DIR``: the median GPU time of a draft step per server and batch size,
+from the ``<server>.steps.jsonl`` files the servers wrote.
+
+``compare DIR [BASELINE]``: per (server, dataset, concurrency), how many
+responses are identical to the BASELINE server's (default ``target``) and the
+mean fraction of the baseline response that agrees before the first difference
+(useful at temperature 0, where speculative decoding is lossless up to
+floating-point differences between batch shapes).
+
 ``table DIR``: one row per benchmark JSON in DIR: output tok/s, mean TPOT and
 ITL, mean TTFT, and the acceptance length (accepted drafts per draft, plus the
 token the target always contributes), from the server's spec-decode counters
@@ -78,11 +87,54 @@ def table(directory: str) -> None:
         )
 
 
+def steps(directory: str) -> None:
+    print("| server | batch | draft step ms (median) | p90 | steps |")
+    print("|---|---|---|---|---|")
+    for path in sorted(Path(directory).glob("*.steps.jsonl")):
+        by_reqs: dict[int, list[float]] = {}
+        for line in path.read_text().splitlines():
+            row = json.loads(line)
+            by_reqs.setdefault(row["reqs"], []).append(row["ms"])
+        for reqs in sorted(by_reqs):
+            times = sorted(by_reqs[reqs])
+            if len(times) < 20:
+                continue
+            median, p90 = times[len(times) // 2], times[int(0.9 * len(times))]
+            label = path.name.removesuffix(".steps.jsonl")
+            print(f"| {label} | {reqs} | {median:.3f} | {p90:.3f} | {len(times)} |")
+
+
+def compare(directory: str, baseline: str = "target") -> None:
+    print("| server | dataset | conc | identical | agreeing prefix |")
+    print("|---|---|---|---|---|")
+    for path in sorted(Path(directory).glob(f"{baseline}_*_c*.json")):
+        rest = path.stem.split("_", 1)[1]
+        reference = json.loads(path.read_text()).get("generated_texts") or []
+        for other in sorted(Path(directory).glob(f"*_{rest}.json")):
+            label = other.stem.split("_", 1)[0]
+            if label == baseline:
+                continue
+            texts = json.loads(other.read_text()).get("generated_texts") or []
+            pairs = list(zip(reference, texts))
+            same = sum(a == b for a, b in pairs)
+            prefix = []
+            for a, b in pairs:
+                n = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
+                prefix.append(n / max(len(a), 1))
+            dataset, conc = rest.rsplit("_c", 1)
+            mean_prefix = sum(prefix) / max(len(prefix), 1)
+            print(f"| {label} | {dataset} | {conc} | {same}/{len(pairs)} | {mean_prefix:.3f} |")
+
+
 if __name__ == "__main__":
     command, *args = sys.argv[1:]
     if command == "prompts":
         write_prompts(*args)
     elif command == "table":
         table(*args)
+    elif command == "steps":
+        steps(*args)
+    elif command == "compare":
+        compare(*args)
     else:
         raise SystemExit(f"unknown command {command!r}")

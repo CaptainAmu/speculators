@@ -97,6 +97,18 @@ At temperature 1 (drafts sampled, `"draft_sample_method": "probabilistic"`):
 | MT-Bench  | 1           | 207.8 (3.31)  | 260.4 (3.68)  |
 | MT-Bench  | 16          | 944.9 (2.77)  | 1008.8 (3.02) |
 
+The tables come from
+
+```bash
+TARGET=Qwen/Qwen3-8B PROMPT_DIR=<chat-templated prompts> OUT=runs/qwen3_8b \
+SERVERS="target=none dflash=dflash:z-lab/Qwen3-8B-DFlash-b16 flashmap=flashmap:./FlashMap-Qwen3-8B-v64k" \
+DATASETS="gsm8k humaneval mt-bench" CONCURRENCY="1 4 16" TEMPERATURE=0 \
+MAX_TOKENS=512 PROMPTS_PER_STREAM=4 MIN_PROMPTS=8 MAX_MODEL_LEN=4096 \
+bash examples/evaluate/flashmap/bench_flashmap_vllm.sh
+```
+
+with `TEMPERATURE=1` and `CONCURRENCY="1 16"` for the second.
+
 A FlashMap draft step (GPU time, CUDA graphs) takes 1.59 / 2.01 / 3.78 ms at batch 1 / 4 / 16, against 2.65 / 3.13 / 7.01 ms for DFlash. Two jumps (`FLASHMAP_NUM_STEPS=2`, exact, with a vocabulary-sized state between the jumps) raise the acceptance length (GSM8K 7.68, HumanEval 6.31, MT-Bench 4.19 at concurrency 1) but cost 5.2 ms per draft step, so one jump is faster end to end on this GPU.
 
 ## Research & Citation

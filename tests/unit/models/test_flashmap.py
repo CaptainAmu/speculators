@@ -265,3 +265,22 @@ def test_checkpoint_layout(tmp_path):
         if name.split(".")[0] in {"embed_tokens", "lm_head", "verifier_lm_head"}:
             continue
         torch.testing.assert_close(loaded.state_dict()[name], tensor)
+
+
+def test_semigroup_times_split_and_order():
+    flow_map = FlashMapDraftModel.from_teacher(_tiny_flow())
+    kind, s, u, t = flow_map._sample_semigroup_times(
+        64,
+        torch.device("cpu"),
+        diagonal_fraction=0.5,
+        boundary_prob=0.25,
+        antithetic_sampling=True,
+    )
+    diagonal, boundary = kind == 0, kind == 1
+    assert diagonal.sum() == 32
+    assert boundary.sum() == 8  # int(64 * (0.5 + 0.5 * 0.25)) - 32
+    assert torch.all(s <= u)
+    assert torch.all(u <= t)
+    assert torch.equal(s[diagonal], t[diagonal])
+    assert torch.all(s[boundary] == 0.0)
+    assert torch.all(t[boundary] == 1.0)

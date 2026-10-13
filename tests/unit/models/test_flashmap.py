@@ -90,6 +90,19 @@ def test_flashmap_cli_defaults():
     assert TrainConfig(speculator_type="dflash").dflash.dflash_decay_gamma == 4.0
 
 
+def test_flashmap_trainer_kwargs_follow_the_cli():
+    flat = TrainConfig(speculator_type="flashmap").flatten()
+    train_kwargs, val_kwargs = FlashMapDraftModel.get_trainer_kwargs(**flat)
+    assert train_kwargs["gamma"] == 7.0
+    assert "kl_div" in train_kwargs["loss_config"]
+    assert train_kwargs["max_anchors"] == 512
+    assert (train_kwargs["diagonal_fraction"], train_kwargs["boundary_prob"]) == (
+        0.5,
+        0.0625,
+    )
+    assert val_kwargs.keys() == train_kwargs.keys()
+
+
 def test_decoding_error_grid_matches_release():
     grid = DecodingErrorSchedule(151936).grid(2, torch.device("cpu"))
     assert grid[0] == 0.0

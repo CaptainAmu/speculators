@@ -695,7 +695,12 @@ def main(cfg: TrainConfig):  # noqa: C901
         maybe_destroy_distributed()
         return
 
-    hidden_size = draft_model.config.transformer_layer_config.hidden_size
+    # The verifier's hidden size; drafts whose decoder width differs from it
+    # (FlashMap's DiT) record it as target_hidden_size.
+    hidden_size = (
+        getattr(draft_model.config, "target_hidden_size", None)
+        or draft_model.config.transformer_layer_config.hidden_size
+    )
 
     # Setup dataloaders
     preprocess_fns = {

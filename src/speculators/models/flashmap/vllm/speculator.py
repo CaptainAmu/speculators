@@ -79,6 +79,20 @@ class FlashMapSpeculator(DFlashSpeculator):
             )
         return model
 
+    def _precompute_context_kv(
+        self, start: int, end: int, dummy_run: bool = False
+    ) -> None:
+        # The context rows a draft step stores right before its forward go
+        # through the model's anchor GEMM (FLASHMAP_MERGE_ANCHOR).
+        if self.model.merge_anchor and start == 0 and not dummy_run:
+            self.model.defer_context_kv(
+                self.hidden_states[start:end],
+                self.context_positions[start:end],
+                self._context_slot_mappings[0][start:end],
+            )
+            return
+        super()._precompute_context_kv(start, end, dummy_run)
+
     def capture(self) -> None:
         # Record the KV caches' layout (a host-to-device copy) before capturing.
         self.model.cache_layout()

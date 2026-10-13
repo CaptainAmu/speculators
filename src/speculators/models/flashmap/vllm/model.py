@@ -199,6 +199,10 @@ class FlashMapDraftModel(nn.Module):
         self.time_grid = [float(t) for t in config.time_grids[self.num_steps - 1]]
         # Scales the starting noise (tests set 0 to compare deterministic drafts).
         self.noise_scale = float(os.environ.get("FLASHMAP_NOISE_SCALE", "1"))
+        # Project the committed context together with the anchors (one GEMM over
+        # the context K/V weight per step instead of two), see defer_context_kv.
+        self.merge_anchor = os.environ.get("FLASHMAP_MERGE_ANCHOR", "0") == "1"
+        self._pending_context: tuple[torch.Tensor, ...] | None = None
 
         self.fc = nn.Linear(num_aux * target_hidden, dim, bias=False)
         self.hidden_norm = RMSNorm(dim, eps)
@@ -231,6 +235,7 @@ class FlashMapDraftModel(nn.Module):
             )
         self.vocab_size = vocab_size
         self._compiled = None
+        self._compiled_noise = None
 
     # ------------------------------------------------------------------ loading
 
@@ -377,6 +382,9 @@ class FlashMapDraftModel(nn.Module):
         self._cache_args = None
         if os.environ.get("FLASHMAP_COMPILE", "1") == "1":
             self._compiled = torch.compile(self._dit, dynamic=True, fullgraph=True)
+            self._compiled_noise = torch.compile(
+                self._noise_input, dynamic=True, fullgraph=True
+            )
         torch.cuda.empty_cache()
         logger.info(
             "FlashMap draft: %d jump(s) on grid %s, draft vocabulary %d",
@@ -468,6 +476,16 @@ class FlashMapDraftModel(nn.Module):
             self.hidden_norm(context_states), context_positions, context_slot_mapping
         )
 
+    def defer_context_kv(
+        self,
+        context_states: torch.Tensor,
+        context_positions: torch.Tensor,
+        context_slot_mapping: torch.Tensor,
+    ) -> None:
+        """``precompute_and_store_context_kv``, done by the next ``forward``
+        together with its anchors."""
+        self._pending_context = (context_states, context_positions, context_slot_mapping)
+
     # ------------------------------------------------------------------ drafting
 
     def _dit(
@@ -545,6 +563,9 @@ class FlashMapDraftModel(nn.Module):
         embedding's eigenbasis (see the module docstring)."""
         z = torch.randn(tokens, self.noise_embed.shape[1], device=device,
                         dtype=torch.float32)
+        return (self._compiled_noise or self._noise_input)(z)
+
+    def _noise_input(self, z: torch.Tensor) -> torch.Tensor:
         if self.noise_scale != 1.0:
             z = z * self.noise_scale
         rms = torch.rsqrt((z * z) @ self.noise_eigvals + self.noise_norm.eps)
@@ -590,12 +611,18 @@ class FlashMapDraftModel(nn.Module):
                 self.anchor_proj(F.embedding(anchor_rows, self.embed_tokens))
             )
             # The kernels index positions and slots densely: gather row 0s.
+            anchor_positions = positions.view(blocks, self.block_size)[:, 0]
+            anchor_slots = metadata.slot_mapping[:tokens].view(blocks, self.block_size)[
+                :, 0
+            ]
+            if self._pending_context is not None:
+                states, context_positions, context_slots = self._pending_context
+                anchor_context = torch.cat([self.hidden_norm(states), anchor_context])
+                anchor_positions = torch.cat([context_positions, anchor_positions])
+                anchor_slots = torch.cat([context_slots, anchor_slots])
+                self._pending_context = None
             self._store_context(
-                anchor_context,
-                positions.view(blocks, self.block_size)[:, 0].contiguous(),
-                metadata.slot_mapping[:tokens]
-                .view(blocks, self.block_size)[:, 0]
-                .contiguous(),
+                anchor_context, anchor_positions.contiguous(), anchor_slots.contiguous()
             )
         slot_positions = positions + 1
         dit = self._compiled or self._dit

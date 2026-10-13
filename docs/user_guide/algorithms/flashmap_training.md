@@ -31,7 +31,7 @@ torchrun --standalone --nproc_per_node 8 -m speculators.train \
     --target-layer-ids 2 10 18 26 34 \
     --data-path ./output/qwen3_8b_regen \
     --save-path ./output/flashmap/flow \
-    --optimizer adamw --lr 6e-4 --weight-decay 0.1 \
+    --optimizer adamw --lr 6e-4 --weight-decay 0.1 --adam-beta2 0.95 \
     --max-anchors 512 --epochs 20
 
 # Stage 2: the flow map, distilled from the last flow checkpoint
@@ -42,11 +42,11 @@ torchrun --standalone --nproc_per_node 8 -m speculators.train \
     --flashmap-teacher ./output/flashmap/flow/19 \
     --data-path ./output/qwen3_8b_regen \
     --save-path ./output/flashmap/map \
-    --optimizer adamw --lr 5e-5 --weight-decay 0 \
+    --optimizer adamw --lr 5e-5 --weight-decay 0 --adam-beta2 0.95 \
     --max-anchors 128 --epochs 12
 ```
 
-The flow map holds several vocabulary-sized states per draft slot during a step (the teacher's target and two half-jumps), so it is trained with fewer anchors than the flow. See `examples/train/flashmap_qwen3_8b_two_stage_offline.sh` for the full pipeline.
+The released recipe trains both stages with AdamW and `beta2 = 0.95` (the default 0.999 let the flow's loss spike on a 500k-sample run). The flow map holds several vocabulary-sized states per draft slot during a step (the teacher's target and two half-jumps), so it is trained with fewer anchors than the flow. See `examples/train/flashmap_qwen3_8b_two_stage_offline.sh` for the full pipeline.
 
 ## Key Parameters
 

@@ -147,6 +147,7 @@ class TrainerConfig(NamedTuple):
     val_call_kwargs: dict | None = None
     optimizer: Literal["adamw", "muon"] = "adamw"
     weight_decay: float = 0.01
+    adam_beta2: float = 0.999
     muon_lr: float = 0.02
     muon_momentum: float = 0.95
     muon_weight_decay: float = 0.1

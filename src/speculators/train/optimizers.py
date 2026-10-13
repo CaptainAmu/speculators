@@ -79,6 +79,7 @@ def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
             torch.optim.AdamW(
                 model.named_parameters(),
                 lr=config.lr,
+                betas=(0.9, config.adam_beta2),
                 weight_decay=config.weight_decay,
             )
         ]
@@ -108,6 +109,7 @@ def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
                 torch.optim.AdamW(
                     adamw_params,
                     lr=config.lr,
+                    betas=(0.9, config.adam_beta2),
                     weight_decay=config.weight_decay,
                 )
             )

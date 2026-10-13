@@ -347,6 +347,11 @@ class OptimizerArgs(_Group):
         description="Weight decay for the AdamW optimizer (and the AdamW group in muon "
         "mode).",
     )
+    adam_beta2: float = Field(
+        default=0.999,
+        description="AdamW second-moment decay beta2 (and the AdamW group's in muon "
+        "mode). Lower values such as 0.95 adapt faster to gradient-scale changes.",
+    )
     muon_lr: float | None = Field(
         default=None,
         description="LR for the Muon (2D weights) group. Only used with --optimizer "

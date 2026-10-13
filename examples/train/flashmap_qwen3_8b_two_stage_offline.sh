@@ -34,7 +34,8 @@ SEQ_LENGTH=4096
 CONCURRENCY=32
 TARGET_LAYER_IDS="2 10 18 26 34"  # Must match vLLM's eagle_aux_hidden_state_layer_ids
 
-# Stage 1: the flow (the released recipe: AdamW, weight decay 0.1, 512 anchors).
+# Stage 1: the flow (the released recipe: AdamW with beta2 0.95, weight decay 0.1,
+# 512 anchors).
 FLOW_EPOCHS=20
 FLOW_LR=6e-4
 FLOW_ANCHORS=512
@@ -110,6 +111,7 @@ CUDA_VISIBLE_DEVICES="$GPUS" torchrun \
     --hidden-states-path "$HIDDEN_STATES_DIR" \
     --save-path "$OUTPUT_DIR/flow" \
     --optimizer adamw \
+    --adam-beta2 0.95 \
     --lr "$FLOW_LR" \
     --weight-decay 0.1 \
     --scheduler-type cosine \
@@ -132,6 +134,7 @@ CUDA_VISIBLE_DEVICES="$GPUS" torchrun \
     --hidden-states-path "$HIDDEN_STATES_DIR" \
     --save-path "$OUTPUT_DIR/map" \
     --optimizer adamw \
+    --adam-beta2 0.95 \
     --lr "$MAP_LR" \
     --weight-decay 0 \
     --scheduler-warmup-ratio 0.04 \

@@ -36,12 +36,10 @@ _compiled_flex_attention = torch.compile(flex_attention, dynamic=False)
 def rope_cos_sin(
     position_ids: torch.Tensor, head_dim: int, base: float
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Position ids ``[..., T]`` -> float32 ``(cos, sin)`` of ``[..., T, head_dim/2]``."""
+    """Position ids ``[..., T]`` -> float32 ``(cos, sin)``, ``[..., T, head_dim/2]``."""
     inv_freq = 1.0 / (
         base
-        ** (
-            torch.arange(0, head_dim, 2, device=position_ids.device).float() / head_dim
-        )
+        ** (torch.arange(0, head_dim, 2, device=position_ids.device).float() / head_dim)
     )
     angles = position_ids.float()[..., None] * inv_freq
     return angles.cos(), angles.sin()
@@ -94,7 +92,7 @@ class FlashMapAdaLNZero(nn.Module):
     def __init__(self, hidden_size: int, cond_dim: int, eps: float = 1e-6):
         super().__init__()
         self.linear = nn.Linear(cond_dim, 3 * hidden_size)
-        self.linear._flashmap_zero_init = True  # type: ignore[assignment]
+        self.linear.flashmap_zero_init = True  # type: ignore[assignment]
         self.norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=eps)
 
     def forward(

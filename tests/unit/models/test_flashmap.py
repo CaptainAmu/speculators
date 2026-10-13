@@ -1,5 +1,6 @@
 import pytest
 import torch
+from safetensors import safe_open
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Config
 
 from speculators.config import SpeculatorsConfig, VerifierConfig
@@ -140,7 +141,9 @@ def test_blocks_stay_in_their_document():
     label_docs = docs[blocks.label_indices].view(-1, BLOCK)
     anchor_docs = docs[blocks.anchor_positions].unsqueeze(-1)
     supervised = blocks.label_mask.view(-1, BLOCK)
-    assert torch.all(label_docs[supervised] == anchor_docs.expand_as(label_docs)[supervised])
+    assert torch.all(
+        label_docs[supervised] == anchor_docs.expand_as(label_docs)[supervised]
+    )
     # A supervised prefix per block: never a gap followed by a supervised slot.
     assert torch.all(supervised[:, 1:] <= supervised[:, :-1])
     # Slot positions continue from the anchor's position within its document.
@@ -154,7 +157,9 @@ def test_map_starts_as_its_flow_on_the_diagonal():
     flow = _tiny_flow().eval()
     flow_map = FlashMapDraftModel.from_teacher(flow).eval()
     assert flow_map.config.flow_map
-    assert not any(name.startswith("_teacher") for name, _ in flow_map.named_parameters())
+    assert not any(
+        name.startswith("_teacher") for name, _ in flow_map.named_parameters()
+    )
 
     batch = _batch()
     blocks = flow_map._sample_blocks(
@@ -215,8 +220,6 @@ def test_eval_reports_one_step_draft_metrics():
 def test_checkpoint_layout(tmp_path):
     flow_map = FlashMapDraftModel.from_teacher(_tiny_flow())
     flow_map.save_pretrained(tmp_path)
-    from safetensors import safe_open
-
     with safe_open(tmp_path / "model.safetensors", framework="pt") as f:
         keys = set(f.keys())
     assert "embed_tokens.weight" not in keys

@@ -1,6 +1,6 @@
 # Algorithms
 
-Speculators supports seven speculative decoding algorithms. All are lossless -- they produce output from the same distribution as the target model.
+Speculators supports eight speculative decoding algorithms. All are lossless -- they produce output from the same distribution as the target model.
 
 ## [Eagle-3](eagle3.md)
 
@@ -25,6 +25,10 @@ Extends DFlash with a Markov head for intra-block token dependencies and a confi
 ## [XPress](xpress.md)
 
 Extends DFlash with a causal refiner resolved by Jacobi iteration, giving each draft position visibility of the ones before it at a constant number of refine passes. Experimental training support.
+
+## [FlashMap](flashmap.md)
+
+Drafts a whole block from Gaussian noise in one evaluation of a flow map distilled from a discrete flow, conditioned like DFlash; more jumps trade speed for accuracy. Trained in two stages (the flow, then the map). Experimental training support.
 
 ## [MTP](mtp.md)
 

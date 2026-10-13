@@ -130,7 +130,9 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
         )
 
         # Context: fused auxiliary hidden states, and the anchor token.
-        self.fc = nn.Linear(len(self.target_layer_ids) * hidden_size, dit_size, bias=False)
+        self.fc = nn.Linear(
+            len(self.target_layer_ids) * hidden_size, dit_size, bias=False
+        )
         self.hidden_norm = Qwen3RMSNorm(dit_size, eps=norm_eps)
         self.anchor_proj = nn.Linear(hidden_size, dit_size)
         self.anchor_norm = Qwen3RMSNorm(dit_size, eps=norm_eps)
@@ -151,7 +153,7 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
         if config.flow_map:
             # Zero output: a map initialized from its flow starts as the flow.
             self.jump_embed = FlashMapTimestepEmbedding(cond_dim, cond_dim)
-            self.jump_embed.linear_2._flashmap_zero_init = True  # type: ignore[assignment]
+            self.jump_embed.linear_2.flashmap_zero_init = True  # type: ignore[assignment]
         self.layers = nn.ModuleList(
             [
                 FlashMapDiTLayer(
@@ -168,7 +170,7 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
         self.final_adaln = FlashMapAdaLNZero(dit_size, cond_dim, config.adaln_eps)
         # Zero output: start from a uniform distribution over tokens.
         self.head = nn.Linear(dit_size, hidden_size)
-        self.head._flashmap_zero_init = True  # type: ignore[assignment]
+        self.head.flashmap_zero_init = True  # type: ignore[assignment]
 
         # Only for validation metrics: the verifier's own greedy tokens.
         self.verifier_norm = resolve_verifier_norm_class(config)(
@@ -182,7 +184,7 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
 
     def _init_weights(self, module):
         super()._init_weights(module)
-        if getattr(module, "_flashmap_zero_init", False):
+        if getattr(module, "flashmap_zero_init", False):
             init.zeros_(module.weight)
             init.zeros_(module.bias)
 
@@ -416,7 +418,9 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
         block_size = self.block_size
         loss_mask = loss_mask.bool()
         next_ok = torch.zeros_like(loss_mask)
-        next_ok[:, :-1] = loss_mask[:, 1:] & (document_ids[:, 1:] == document_ids[:, :-1])
+        next_ok[:, :-1] = loss_mask[:, 1:] & (
+            document_ids[:, 1:] == document_ids[:, :-1]
+        )
         anchor_positions, anchor_valid = select_anchors(
             loss_mask & next_ok, num_anchors, block_size
         )
@@ -499,7 +503,7 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
         diagonal_fraction: float = 0.5,
         boundary_prob: float = 0.0625,
         antithetic_sampling: bool = True,
-        **kwargs,
+        **kwargs,  # noqa: ARG002 -- the remaining batch keys
     ):
         if position_ids is None:
             position_ids = torch.arange(
@@ -543,9 +547,7 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
 
         The vocabulary-sized state is carried in the compute dtype."""
         num_blocks = blocks.anchor_positions.numel()
-        taus, times = self.time_schedule.sample(
-            (num_blocks,), blocks.labels.device
-        )
+        taus, times = self.time_schedule.sample((num_blocks,), blocks.labels.device)
         slot_times = times.repeat_interleave(self.block_size).unsqueeze(0)
         with torch.no_grad():
             state = self._interpolant(blocks.labels, slot_times, state_dtype)
@@ -614,15 +616,19 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
             del teacher_kv
 
             # Off-diagonal target: two half-jumps of the current map (eq. 87).
-            log_su = self.denoise(
-                state, s_slot, positions, ctx_kv, ctx_mask, end=u_slot
-            ).float().log_softmax(dim=-1)
+            log_su = (
+                self.denoise(state, s_slot, positions, ctx_kv, ctx_mask, end=u_slot)
+                .float()
+                .log_softmax(dim=-1)
+            )
             coef_state = per_slot((1.0 - u) / (1.0 - s + 1e-8)).float().unsqueeze(-1)
             coef_delta = per_slot((u - s) / (1.0 - s + 1e-8)).float().unsqueeze(-1)
             x_su = coef_state * state + coef_delta * log_su.exp()
-            log_ut = self.denoise(
-                x_su, u_slot, positions, ctx_kv, ctx_mask, end=t_slot
-            ).float().log_softmax(dim=-1)
+            log_ut = (
+                self.denoise(x_su, u_slot, positions, ctx_kv, ctx_mask, end=t_slot)
+                .float()
+                .log_softmax(dim=-1)
+            )
             del x_su
             # The 1e-8 (the official code's) also makes gamma 0 on the diagonal.
             mix = (1.0 - t) * (u - s) / ((1.0 - u) * (t - s) + 1e-8)
@@ -700,7 +706,9 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
         h = uniform()
         tau_s_off = uniform() * (1.0 - h)
         zero, one = torch.zeros_like(h), torch.ones_like(h)
-        tau_s = torch.where(diagonal, tau_diagonal, torch.where(boundary, zero, tau_s_off))
+        tau_s = torch.where(
+            diagonal, tau_diagonal, torch.where(boundary, zero, tau_s_off)
+        )
         tau_t = torch.where(
             diagonal, tau_diagonal, torch.where(boundary, one, tau_s_off + h)
         )
@@ -718,9 +726,7 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
         """One-step drafts of every block (the flow's denoiser at ``t = 0``, or the
         map's jump ``delta_{0,1}``) scored against the verifier's greedy tokens."""
         shape = blocks.labels.shape
-        noise = torch.randn(
-            *shape, self.draft_vocab_size, device=blocks.labels.device
-        )
+        noise = torch.randn(*shape, self.draft_vocab_size, device=blocks.labels.device)
         start = torch.zeros(shape, device=noise.device)
         end = torch.ones(shape, device=noise.device) if self.config.flow_map else None
         draft_logits = self.denoise(

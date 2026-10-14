@@ -13,7 +13,11 @@ import os
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
-from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+from torch.distributed.fsdp import (
+    MixedPrecisionPolicy,
+    fully_shard,
+    register_fsdp_forward_method,
+)
 
 logger = logging.getLogger("speculators")
 
@@ -210,6 +214,10 @@ def apply_fully_sharded(
 
     for layer in model.layers:  # type: ignore[union-attr]
         fully_shard(layer, mp_policy=mp_policy)
+        # Methods besides forward that use the layer's parameters (e.g. FlashMap's
+        # context projection) need FSDP's unshard/reshard and gradient hooks too.
+        for method in getattr(layer, "fsdp_forward_methods", ()):
+            register_fsdp_forward_method(layer, method)
 
     fully_shard(model, mp_policy=mp_policy)
 

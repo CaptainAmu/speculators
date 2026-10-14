@@ -66,6 +66,24 @@ def split_named_params_for_muon(
     return muon_params, adamw_params
 
 
+def adamw_param_groups(model: Module, named_params) -> list:
+    """AdamW's parameters: one decayed group, or, for a model that sets
+    ``weight_decay_on_vectors = False`` (e.g. FlashMap, whose norm gains are
+    stored as ``1 + scale``), decay on matrices only, not on biases and gains."""
+    named_params = list(named_params)
+    raw_model = getattr(model, "module", model)  # DDP wraps the model
+    if getattr(raw_model, "weight_decay_on_vectors", True):
+        return named_params
+    groups: list[dict] = [
+        {"params": [(n, p) for n, p in named_params if p.ndim >= _MATRIX_NDIM]},
+        {
+            "params": [(n, p) for n, p in named_params if p.ndim < _MATRIX_NDIM],
+            "weight_decay": 0.0,
+        },
+    ]
+    return [group for group in groups if group["params"]]
+
+
 def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
     """Build the optimizer(s) for a training run based on ``config.optimizer``.
 
@@ -77,7 +95,7 @@ def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
     if config.optimizer == "adamw":
         return [
             torch.optim.AdamW(
-                model.named_parameters(),
+                adamw_param_groups(model, model.named_parameters()),
                 lr=config.lr,
                 betas=(0.9, config.adam_beta2),
                 weight_decay=config.weight_decay,
@@ -107,7 +125,7 @@ def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
         if adamw_params:
             optimizers.append(
                 torch.optim.AdamW(
-                    adamw_params,
+                    adamw_param_groups(model, adamw_params),
                     lr=config.lr,
                     betas=(0.9, config.adam_beta2),
                     weight_decay=config.weight_decay,

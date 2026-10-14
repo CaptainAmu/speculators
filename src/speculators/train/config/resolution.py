@@ -104,6 +104,14 @@ _ALGORITHM_GROUP_USERS: dict[str, frozenset[str]] = {
 }
 
 
+# Fields of a group that a speculator type in its users set still ignores.
+_ALGORITHM_IGNORED_FIELDS: dict[str, frozenset[str]] = {
+    "flashmap": frozenset(
+        {"sample_from_anchor", "per_position_loss_weight", "dpace_alpha"}
+    ),
+}
+
+
 # Marker key (schema ``_CLI_CHOICES``) -> the live registry supplying a field's
 # argparse choices. Binding the registry here -- not in the schema -- keeps the schema
 # free of runtime backend objects.
@@ -382,6 +390,16 @@ def _warn_mismatched_algorithm_blocks(cfg: TrainConfig, provided: set[str]) -> N
                 f"algorithm group; these settings are ignored: {', '.join(ignored)}",
                 stacklevel=2,
             )
+    ignored = sorted(
+        _dest_to_flag(dest)
+        for dest in _ALGORITHM_IGNORED_FIELDS.get(cfg.speculator_type, ())
+        if dest in provided
+    )
+    if ignored:
+        warnings.warn(
+            f"--speculator-type {cfg.speculator_type} ignores: {', '.join(ignored)}",
+            stacklevel=2,
+        )
 
 
 def _warn_deprecated(provided: set[str]) -> None:

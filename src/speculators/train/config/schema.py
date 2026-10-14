@@ -92,8 +92,9 @@ class DraftArgs(_Group):
     )
     num_layers: int | None = Field(
         default=None,
-        description="Number of draft decoder layers to synthesize. "
-        "(default: 5 for dflash/dspark/dflash2, 1 otherwise).",
+        description="Number of draft decoder layers to synthesize (DiT blocks for "
+        "flashmap). (default: 6 for flashmap, 5 for dflash/dspark/dflash2/xpress, "
+        "1 otherwise).",
     )
     draft_arch: Literal["llama", "qwen3"] | None = Field(
         default=None,
@@ -223,10 +224,12 @@ class DataArgs(_Group):
     )
     num_workers: int = Field(default=12, description="Number of dataloader workers.")
     prefetch_factor: int = Field(default=4, description="Dataloader prefetch factor.")
-    max_anchors: int = Field(
-        default=512,
-        description="Maximum anchor positions for DFlash-family and P-EAGLE training "
-        "(default: 512).",
+    max_anchors: int | None = Field(
+        default=None,
+        description="Maximum anchor positions per packed row for DFlash-family, "
+        "FlashMap and P-EAGLE training (default: 128 for a FlashMap flow map, i.e. "
+        "with --flashmap-teacher, whose step holds several vocabulary-sized states "
+        "per slot; 512 otherwise).",
     )
 
     @field_validator("hidden_states_dtype")
@@ -373,8 +376,10 @@ class OptimizerArgs(_Group):
 
 
 class SchedulerArgs(_Group):
-    scheduler_type: Literal["linear", "cosine", "none"] = Field(
-        default="linear", description="LR scheduler type."
+    scheduler_type: Literal["linear", "cosine", "wsd", "none"] = Field(
+        default="linear",
+        description="LR scheduler type. 'wsd': warmup, hold, then a cosine anneal "
+        "over the last --scheduler-decay-ratio of the steps.",
     )
     scheduler_warmup_steps: int | None = Field(
         default=None, description="Warmup steps (default: scheduler-dependent)."
@@ -389,6 +394,12 @@ class SchedulerArgs(_Group):
     )
     scheduler_num_cosine_cycles: float = Field(
         default=0.5, description="Number of cosine cycles for the cosine scheduler."
+    )
+    scheduler_decay_ratio: float = Field(
+        default=0.2,
+        gt=0.0,
+        le=1.0,
+        description="Fraction of the total steps the 'wsd' scheduler anneals over.",
     )
 
 
@@ -475,7 +486,7 @@ class DFlashArgs(_Group):
     dflash_decay_gamma: float | None = Field(
         default=None,
         description="Decay gamma for DFlash-family loss weighting "
-        "(default: 7 for flashmap, 4 otherwise).",
+        "(default: 7 for flashmap, 4 otherwise; for flashmap, 0 disables the decay).",
     )
     per_position_loss_weight: Literal["fixed-exp-decay", "dpace"] | None = Field(
         default=None,
@@ -862,9 +873,27 @@ class TrainConfig(BaseSettings):
             self.loss.loss_fn = _DEFAULT_LOSS_FN.get(self.speculator_type, "kl_div")
         if self.dflash.block_size is None:
             self.dflash.block_size = _DEFAULT_BLOCK_SIZE.get(self.speculator_type, 8)
+        if self.data.max_anchors is None:
+            is_flow_map = (
+                self.speculator_type == "flashmap"
+                and self.flashmap.flashmap_teacher is not None
+            )
+            self.data.max_anchors = 128 if is_flow_map else 512
         if self.dflash.dflash_decay_gamma is None:
             self.dflash.dflash_decay_gamma = _DEFAULT_DECAY_GAMMA.get(
                 self.speculator_type, 4.0
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_flashmap_teacher(self) -> "TrainConfig":
+        """A flow map starts from its teacher, so a separate initial draft is
+        ambiguous; a stage-2 run resumes from its own --save-path instead."""
+        if self.flashmap.flashmap_teacher and self.draft.from_pretrained:
+            raise ValueError(
+                "--flashmap-teacher and --from-pretrained are mutually exclusive: "
+                "the flow map is initialized from its teacher (rerun with the same "
+                "--save-path to resume a flow-map run)"
             )
         return self
 

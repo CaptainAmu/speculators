@@ -19,6 +19,7 @@ from tqdm.rich import tqdm
 from transformers import (
     get_cosine_schedule_with_warmup,
     get_linear_schedule_with_warmup,
+    get_wsd_schedule,
 )
 
 from speculators.model import SpeculatorModel
@@ -153,11 +154,12 @@ class TrainerConfig(NamedTuple):
     muon_weight_decay: float = 0.1
     muon_ns_steps: int = 5
     muon_adjust_lr_fn: str = "match_rms_adamw"
-    scheduler_type: Literal["linear", "cosine", "none"] = "linear"
+    scheduler_type: Literal["linear", "cosine", "wsd", "none"] = "linear"
     scheduler_warmup_steps: int | None = None
     scheduler_warmup_ratio: float | None = None
     scheduler_total_steps: int | None = None
     scheduler_num_cosine_cycles: float = 0.5
+    scheduler_decay_ratio: float = 0.2
     checkpoint_freq: float = 1
     save_best: bool = False
     hidden_states_dtype: torch.dtype = torch.bfloat16
@@ -207,6 +209,41 @@ def _resolve_scheduler_steps(
         scheduler_warmup_steps = scheduler_total_steps // 100
 
     return scheduler_warmup_steps, scheduler_total_steps
+
+
+def make_scheduler(
+    opt: torch.optim.Optimizer,
+    config: TrainerConfig,
+    warmup_steps: int,
+    total_steps: int,
+    last_epoch: int = -1,
+) -> torch.optim.lr_scheduler.LRScheduler:
+    """The LR scheduler ``config.scheduler_type`` names, for one optimizer."""
+    if config.scheduler_type == "linear":
+        return get_linear_schedule_with_warmup(
+            opt,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_steps,
+            last_epoch=last_epoch,
+        )
+    if config.scheduler_type == "wsd":
+        # Warmup, hold, then a cosine anneal over the last scheduler_decay_ratio
+        # of the steps.
+        return get_wsd_schedule(
+            opt,
+            num_warmup_steps=warmup_steps,
+            num_decay_steps=max(1, int(config.scheduler_decay_ratio * total_steps)),
+            num_training_steps=total_steps,
+            decay_type="cosine",
+            last_epoch=last_epoch,
+        )
+    return get_cosine_schedule_with_warmup(
+        opt,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps,
+        num_cycles=config.scheduler_num_cosine_cycles,
+        last_epoch=last_epoch,
+    )
 
 
 class Trainer:
@@ -414,23 +451,16 @@ class Trainer:
             self.config, len(self.train_loader)
         )
 
-        def make_scheduler(opt: torch.optim.Optimizer):
-            if self.config.scheduler_type == "linear":
-                return get_linear_schedule_with_warmup(
-                    opt,
-                    num_warmup_steps=scheduler_warmup_steps,
-                    num_training_steps=scheduler_total_steps,
-                    last_epoch=last_epoch,
-                )
-            return get_cosine_schedule_with_warmup(
+        self.schedulers = [
+            make_scheduler(
                 opt,
-                num_warmup_steps=scheduler_warmup_steps,
-                num_training_steps=scheduler_total_steps,
-                num_cycles=self.config.scheduler_num_cosine_cycles,
-                last_epoch=last_epoch,
+                self.config,
+                scheduler_warmup_steps,
+                scheduler_total_steps,
+                last_epoch,
             )
-
-        self.schedulers = [make_scheduler(opt) for opt in self.optimizers]
+            for opt in self.optimizers
+        ]
 
         if self.resume_from_checkpoint and self.checkpointer.previous_epoch != -1:
             self.checkpointer.load_scheduler_state_dict(self.schedulers)

@@ -576,12 +576,14 @@ def build_draft_model(
                 trust_remote_code=args.trust_remote_code,
             )
 
-        args.mask_token_id = resolve_mask_token_id(
-            args.verifier_name_or_path,
-            transformer_layer_config.vocab_size,
-            args.mask_token_id,
-            trust_remote_code=args.trust_remote_code,
-        )
+        # FlashMap's draft slots start from noise, not from a mask token.
+        if args.speculator_type != "flashmap":
+            args.mask_token_id = resolve_mask_token_id(
+                args.verifier_name_or_path,
+                transformer_layer_config.vocab_size,
+                args.mask_token_id,
+                trust_remote_code=args.trust_remote_code,
+            )
 
     args.draft_vocab_size = draft_vocab_size
     return model_class.from_training_args(
@@ -764,6 +766,7 @@ def main(cfg: TrainConfig):  # noqa: C901
         scheduler_warmup_ratio=args.scheduler_warmup_ratio,
         scheduler_total_steps=args.scheduler_total_steps,
         scheduler_num_cosine_cycles=args.scheduler_num_cosine_cycles,
+        scheduler_decay_ratio=args.scheduler_decay_ratio,
         checkpoint_freq=args.checkpoint_freq,
         save_best=args.save_best,
         hidden_states_dtype=hidden_states_dtype,

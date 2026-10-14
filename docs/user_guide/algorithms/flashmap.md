@@ -18,7 +18,16 @@ With one jump (the default) a slot's input is the embedding of its noise at time
 
 ## Serving with vLLM
 
-Speculators ships FlashMap's vLLM support as a vLLM plugin, registered under the `vllm.general_plugins` entry point when speculators is installed, so no vLLM changes are needed. It requires vLLM's V2 model runner (the default) and runs on vLLM's DFlash runtime: context K/V precompute, attention metadata and full CUDA graphs of the draft step are DFlash's own.
+Speculators ships FlashMap's vLLM support as a vLLM plugin, registered under the `vllm.general_plugins` entry point when speculators is installed, so no vLLM changes are needed. It runs on vLLM's DFlash runtime: model loading, the context K/V precompute, attention metadata and the full CUDA graph of the draft step are DFlash's own.
+
+Requirements:
+
+- vLLM 0.31.x, with speculators installed in the same environment (on other versions the plugin logs a warning and stays out of the way);
+- vLLM's V2 model runner (the default; not `VLLM_USE_V2_MODEL_RUNNER=0`);
+- tensor parallel size 1;
+- the FlashAttention attention backend and a bf16 KV cache (no fp8 draft KV cache).
+
+Each of these is checked when the draft model loads, with an error that names it.
 
 Convert a released FlashMap checkpoint (or a DeepSpec flow-map checkpoint) to the speculators format:
 
@@ -36,39 +45,42 @@ vllm serve ./FlashMap-Qwen3-8B-speculators
 or explicitly:
 
 ```bash
-vllm serve Qwen/Qwen3-8B \
-    --speculative-config '{"model": "./FlashMap-Qwen3-8B-speculators", "method": "dflash"}'
+vllm serve Qwen/Qwen3-8B --speculative-config \
+    '{"model": "./FlashMap-Qwen3-8B-speculators", "method": "dflash", "num_speculative_tokens": 16}'
 ```
 
 For sampling at temperature > 0, add `"draft_sample_method": "probabilistic"` to the speculative config so that drafts are sampled from FlashMap's distribution and verified against it (with the default `greedy` draft sampling verification is still exact, but accepts less).
 
-| Environment variable | Default            | Description                                          |
-| -------------------- | ------------------ | ---------------------------------------------------- |
-| `FLASHMAP_NUM_STEPS` | config `num_steps` | Jumps per draft block (1 is fastest)                 |
-| `FLASHMAP_COMPILE`   | `1`                | torch.compile the DiT (fuses its elementwise chains) |
+`num_speculative_tokens` may be smaller than the block (16): the draft still evaluates its whole block and proposes its first `num_speculative_tokens` slots. Verification then checks fewer tokens, which pays off at high concurrency, where verification dominates.
 
-### Restricted Draft Vocabulary
+| Environment variable    | Default            | Description                                                         |
+| ----------------------- | ------------------ | ------------------------------------------------------------------- |
+| `FLASHMAP_NUM_STEPS`    | config `num_steps` | Jumps per draft block (1 is fastest); also set by `speculators convert --algorithm-kwargs '{"num_steps": 2}'` |
 
-The largest weight a draft step reads is the output head over the vocabulary. `speculators convert` can restrict it to the target's most frequent tokens (a ranking file, safetensors key `ids`), stored as the usual `d2t`/`t2d` mappings:
+### Draft Vocabulary
 
-```bash
-speculators convert ./FlashMap-Qwen3-8B --algorithm flashmap --verifier Qwen/Qwen3-8B \
-    --output-path ./FlashMap-Qwen3-8B-v64k \
-    --algorithm-kwargs '{"draft_vocab_size": 65536, "draft_vocab_file": "qwen3_8b_ranking.safetensors"}'
-```
-
-A token outside the draft vocabulary is never drafted; verification stays exact.
+The largest weight a draft step reads is the output head over the vocabulary. A released checkpoint ships a ranking of the target's tokens (`draft_vocab.safetensors`), and `speculators convert` restricts the draft head to its 65536 most frequent tokens by default, stored as the usual `d2t`/`t2d` mappings; `--algorithm-kwargs '{"draft_vocab_size": 0}'` keeps the full vocabulary, and `{"draft_vocab_size": N, "draft_vocab_file": "ranking.safetensors"}` picks another size or ranking. A token outside the draft vocabulary is never drafted; verification stays exact.
 
 ### Implementation Notes
 
 The draft step (`speculators/models/flashmap/vllm/`) is built for latency:
 
 - everything that depends only on the jump times (every AdaLN modulation, the constant embedding of the uniform posterior at time 0) is computed once at load;
-- the one-jump noise is drawn in the embedding's space: `x0 @ E ~ N(0, E^T E)` is drawn as `z @ A` with `A = sqrt(Lambda) Q^T` from `E^T E = Q Lambda Q^T`, so no vocabulary-sized noise is formed, the noise norm's RMS is elementwise in `z`, and `A`, the noise norm and `x_embed` fold into one matrix;
-- every layer's context keys/values come from one GEMM and are written to the paged KV cache, k-normed and rotated, by one Triton kernel, for committed tokens only; the anchor's entry is written at the anchor position and overwritten once the target verifies it;
-- cross-attention reads the paged cache with FlashAttention (non-causal, `block_size` queries per request); self-attention within the block, with its QK norms and RoPE, is one Triton kernel;
-- the DiT's output head is folded into the LM head;
-- the DiT is compiled with torch.compile and the whole draft step runs in vLLM's full CUDA graph, with no host synchronization.
+- the one-jump noise is drawn in the embedding's space: `x0 @ E ~ N(0, E^T E)` is drawn as `z @ A` with `A = sqrt(Lambda) Q^T` from `E^T E = Q Lambda Q^T`, so no vocabulary-sized noise is formed, the noise norm's RMS is elementwise in `z`, and `A`, the noise norm and `x_embed` fold into one matrix (`fold.py`);
+- the keys/values of the context committed since the last step and of every request's anchor come from one GEMM over all layers' weights and are written to the paged KV cache, k-normed and rotated, by one Triton kernel; the anchor's entry is written at the anchor position and overwritten once the target verifies it;
+- cross-attention reads the paged cache with FlashAttention (non-causal, `block_size` queries per request, one FlashAttention 3 tile schedule shared by all layers); self-attention within the block, with its QK norms and RoPE, is one Triton kernel;
+- the DiT's output head is folded into the LM head; greedy drafts take a split argmax over it, and sampled drafts with a restricted vocabulary write their proposal distribution straight into vLLM's cached draft logits;
+- the noise is keyed by each request's seed and each slot's position, so a seeded request drafts the same blocks on every run;
+- the DiT is compiled with torch.compile and the whole draft step is replayed from vLLM's full CUDA graph; the step's inputs are prepared on the GPU, without waiting on the host.
+
+### Upstreaming to vLLM
+
+The plugin's model, speculator and kernels are written to move into vLLM unchanged (as `model_executor/models/flashmap.py` and `v1/worker/gpu/spec_decode/flashmap/`). The plugin's hooks then become one-line registrations, as for DFlash2:
+
+- `transformers_utils/configs/speculators/algos.py`: `@register_speculator("flashmap")` on `update_flashmap`;
+- `transformers_utils/configs/speculators/base.py` (`build_vllm_speculative_config`): map `"flashmap"` to `"dflash"`, as `"dflash2"` is;
+- `model_executor/models/registry.py`: `"FlashMapDraftModel": ("flashmap", "FlashMapDraftModel")` among the speculative decoding models;
+- `v1/worker/gpu/spec_decode/__init__.py` (`init_speculator`): return `FlashMapSpeculator` when `"FlashMapDraftModel"` is in the draft's architectures, next to the `DFlash2DraftModel` case.
 
 ### Performance
 

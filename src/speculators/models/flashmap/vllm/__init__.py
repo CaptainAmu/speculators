@@ -37,6 +37,7 @@ _FLASHMAP_FIELDS = (
     "draft_vocab_size",
     "block_size",
     "timestep_embed_dim",
+    "timestep_frequency_dim",
     "time_scale",
     "qk_norm_eps",
     "adaln_eps",
@@ -50,6 +51,12 @@ _FLASHMAP_FIELDS = (
 def update_flashmap(config_dict: dict, pre_trained_config: dict) -> None:
     """Map a ``flashmap`` speculators config onto the dict vLLM builds the draft
     model's config from (cf. vLLM's ``update_dflash``)."""
+    if config_dict.get("flow_map") is False:
+        raise ValueError(
+            "This FlashMap checkpoint is a stage-1 flow (flow_map: false), which "
+            "drafts only by integrating over many steps; serve the flow map "
+            "distilled from it (speculators train --flashmap-teacher <flow>)."
+        )
     pre_trained_config["architectures"] = [FLASHMAP_ARCHITECTURE]
     aux_layer_ids = config_dict["aux_hidden_state_layer_ids"]
     pre_trained_config["eagle_aux_hidden_state_layer_ids"] = aux_layer_ids

@@ -1,9 +1,12 @@
 """FlashMap checkpoint converter.
 
 Converts a FlashMap checkpoint to a Speculators checkpoint that vLLM serves
-(``vllm serve <output>``, see ``speculators.models.flashmap.vllm``). Two sources
+(``vllm serve <output>``, see ``speculators.models.flashmap.vllm``). Three sources
 are accepted:
 
+* a speculators FlashMap checkpoint (``speculators_model_type: "flashmap"``,
+  e.g. one ``speculators train`` saved), which vLLM serves as it is; converting
+  it only adds a restricted draft vocabulary;
 * a released FlashMap checkpoint (``model_type: "flashmap"``), whose weights
   already carry the canonical names and are copied as they are;
 * a DeepSpec training checkpoint (a ``Qwen3DFlashier*FlowMapModel``), whose
@@ -13,8 +16,9 @@ are accepted:
   ``embed_tokens``/``lm_head`` copies are dropped (they are the verifier's).
 
 Optionally the draft head is restricted to the verifier's most frequent tokens:
-``draft_vocab_file`` holds a ranking (safetensors key ``ids``) and the first
-``draft_vocab_size`` of its ids become the draft vocabulary, stored as the
+``draft_vocab_file`` holds a ranking (safetensors key ``ids``) or speculators'
+token frequencies (``token_freq.pt``, as ``prepare-data`` writes them), and the
+first ``draft_vocab_size`` tokens become the draft vocabulary, stored as the
 speculators ``d2t``/``t2d`` mappings.
 """
 
@@ -35,6 +39,7 @@ from speculators.convert.utils import (
 from speculators.models.flashmap import FlashMapSpeculatorConfig
 from speculators.models.flashmap.config import DEFAULT_TIME_GRIDS
 from speculators.proposals.greedy import GreedyTokenProposalConfig
+from speculators.train.vocab_mapping import build_vocab_mappings_from_distribution
 
 __all__ = ["FlashMapConverter", "deepspec_to_canonical"]
 
@@ -157,12 +162,23 @@ class FlashMapConverter:
                 f"checkpoint was trained on hidden size {target_hidden}, but "
                 f"{base_model} has {verifier_config['hidden_size']}"
             )
+        if source.get("speculators_model_type") == "flashmap":
+            # Already this schema (e.g. saved by speculators train).
+            if source.get("flow_map") is False:
+                raise ValueError(
+                    "this is a stage-1 FlashMap flow (flow_map: false); convert "
+                    "the flow map distilled from it"
+                )
+            config = FlashMapSpeculatorConfig.model_validate(dict(source))
+            config.num_steps = num_steps
+            return config
         num_layers = 1 + max(
             int(k.split(".")[1]) for k in weights if k.startswith("layers.")
         )
         head_dim = weights["layers.0.self_attn.q_norm.weight"].shape[0]
         intermediate = weights["layers.0.mlp.fc1.weight"].shape[0]
         cond_dim = weights["time_embed.linear_1.weight"].shape[0]
+        frequency_dim = weights["time_embed.linear_1.weight"].shape[1]
 
         # DeepSpec's target_layer_ids index decoder outputs; speculators' aux ids
         # index the decoder layer whose input vLLM captures (one later).
@@ -215,11 +231,12 @@ class FlashMapConverter:
             time_grids = [time_grids[str(n)] for n in range(1, len(time_grids) + 1)]
         return FlashMapSpeculatorConfig(
             transformer_layer_config=transformer_layer_config,  # type: ignore[arg-type]
-            draft_vocab_size=transformer_layer_config["vocab_size"],
+            draft_vocab_size=int(verifier_config["vocab_size"]),
             block_size=block_size,
             target_hidden_size=target_hidden,
             aux_hidden_state_layer_ids=aux_layer_ids,
             timestep_embed_dim=cond_dim,
+            timestep_frequency_dim=frequency_dim if frequency_dim != cond_dim else None,
             time_scale=float(
                 source.get("dit_time_scale", source.get("time_scale", 1000.0))
             ),
@@ -237,7 +254,13 @@ class FlashMapConverter:
         path: str, size: int, config: FlashMapSpeculatorConfig
     ) -> dict[str, torch.Tensor]:
         """speculators ``d2t`` (draft id -> target id offset) and ``t2d`` (target
-        id in the draft vocabulary) for the first ``size`` ids of a ranking."""
+        id in the draft vocabulary) for the first ``size`` ids of a ranking, or
+        the ``size`` most frequent tokens of a ``token_freq.pt``."""
+        if path.endswith(".pt"):
+            d2t, t2d = build_vocab_mappings_from_distribution(
+                torch.load(path, weights_only=True), size, config.target_vocab_size
+            )
+            return {"d2t": d2t, "t2d": t2d}
         ranking = load_file(path)["ids"]
         ids = ranking[:size].to(torch.int64).sort().values
         if ids.numel() != size:

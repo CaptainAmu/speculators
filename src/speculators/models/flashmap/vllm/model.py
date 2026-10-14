@@ -114,14 +114,15 @@ class RMSNorm(nn.Module):
 
 
 class TimestepEmbedding(nn.Module):
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, frequency_dim: int | None = None):
         super().__init__()
-        self.dim = dim
-        self.linear_1 = nn.Linear(dim, dim)
+        self.frequency_dim = frequency_dim or dim
+        self.linear_1 = nn.Linear(self.frequency_dim, dim)
         self.linear_2 = nn.Linear(dim, dim)
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
-        emb = timestep_embedding(t, self.dim).to(self.linear_1.weight.dtype)
+        emb = timestep_embedding(t, self.frequency_dim)
+        emb = emb.to(self.linear_1.weight.dtype)
         return self.linear_2(F.silu(self.linear_1(emb)))
 
 
@@ -210,8 +211,9 @@ class FlashMapDraftModel(nn.Module):
         self.noise_norm = RMSNorm(target_hidden, eps)
         self.noise_gate = nn.Parameter(torch.ones(1), requires_grad=False)
         self.x_embed = nn.Linear(target_hidden, dim)
-        self.time_embed = TimestepEmbedding(config.timestep_embed_dim)
-        self.jump_embed = TimestepEmbedding(config.timestep_embed_dim)
+        frequency_dim = getattr(config, "timestep_frequency_dim", None)
+        self.time_embed = TimestepEmbedding(config.timestep_embed_dim, frequency_dim)
+        self.jump_embed = TimestepEmbedding(config.timestep_embed_dim, frequency_dim)
         start = vllm_config.model_config.get_total_num_hidden_layers()
         model_prefix = f"{prefix}.model" if prefix else "model"
         self.layers = nn.ModuleList(

@@ -105,7 +105,8 @@ def convert(
 
     \b
     algorithm=="flashmap":
-        FlashMap (a released checkpoint or a DeepSpec flow-map checkpoint)
+        FlashMap (a released, DeepSpec flow-map or speculators-trained checkpoint;
+        the draft_vocab_file is a ranking or prepare-data's token_freq.pt)
         ::
         speculators convert ./FlashMap-Qwen3-8B \\
             --algorithm flashmap \\

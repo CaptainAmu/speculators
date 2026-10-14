@@ -139,7 +139,9 @@ CUDA_VISIBLE_DEVICES="$GPUS" torchrun \
     --adam-beta2 0.95 \
     --lr "$MAP_LR" \
     --weight-decay 0 \
+    --scheduler-type wsd \
     --scheduler-warmup-ratio 0.04 \
+    --scheduler-decay-ratio 0.2 \
     --epochs "$MAP_EPOCHS" \
     --max-anchors "$MAP_ANCHORS" \
     --total-seq-len "$SEQ_LENGTH" \

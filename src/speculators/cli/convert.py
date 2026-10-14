@@ -13,6 +13,7 @@ class AlgorithmChoice(str, Enum):
     eagle3 = "eagle3"
     mtp = "mtp"
     dflash = "dflash"
+    flashmap = "flashmap"
 
 
 def convert(
@@ -101,6 +102,16 @@ def convert(
         speculators convert "z-lab/Qwen3-8B-DFlash-b16" \\
             --algorithm dflash \\
             --verifier "Qwen/Qwen3-8B"
+
+    \b
+    algorithm=="flashmap":
+        FlashMap (a released checkpoint or a DeepSpec flow-map checkpoint)
+        ::
+        speculators convert ./FlashMap-Qwen3-8B \\
+            --algorithm flashmap \\
+            --verifier "Qwen/Qwen3-8B" \\
+            --algorithm-kwargs \\
+            '{"draft_vocab_size": 65536, "draft_vocab_file": "ranking.safetensors"}'
     """
     if not algorithm_kwargs:
         algorithm_kwargs = {}

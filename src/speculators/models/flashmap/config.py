@@ -59,6 +59,11 @@ class FlashMapSpeculatorConfig(DFlashSpeculatorConfig):
         default=256,
         description="Width of the sinusoidal timestep embedding and AdaLN condition.",
     )
+    timestep_frequency_dim: int | None = Field(
+        default=None,
+        description="Width of the sinusoidal timestep embedding when it differs "
+        "from timestep_embed_dim (the released config's time_embed_dim).",
+    )
     time_scale: float = Field(
         default=1000.0,
         description="Times are multiplied by this before the sinusoidal embedding.",

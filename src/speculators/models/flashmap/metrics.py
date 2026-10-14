@@ -26,14 +26,19 @@ _EPS = 1e-6
 def slot_loss_weights(
     label_mask: torch.Tensor,  # [1, num_blocks * block_size]
     block_size: int,
-    gamma: float,
+    gamma: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-slot loss weights ``mask * exp(-k / gamma)`` for slot ``k`` of each
-    block (DFlash's decay, with every slot a draft token), and the slot index."""
+    block (DFlash's decay, with every slot a draft token; none when ``gamma`` is
+    None or not positive), and the slot index."""
     pos_idx = torch.arange(label_mask.shape[1], device=label_mask.device) % block_size
     pos_idx = pos_idx.unsqueeze(0)
-    decay = dflash_loss_decay(pos_idx.float(), gamma, sample_from_anchor=True)
-    return label_mask.float() * decay, pos_idx
+    weights = label_mask.float()
+    if gamma is not None and gamma > 0:
+        weights = weights * dflash_loss_decay(
+            pos_idx.float(), gamma, sample_from_anchor=True
+        )
+    return weights, pos_idx
 
 
 def _counted(metrics: dict[str, Any], name: str, num, den) -> None:

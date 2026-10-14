@@ -82,6 +82,7 @@ class FlashMapTimestepEmbedding(nn.Module):
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         emb = timestep_embedding(t, self.frequency_size)
+        emb = emb.to(self.linear_1.weight.dtype)
         return self.linear_2(self.act(self.linear_1(emb)))
 
 
@@ -169,6 +170,10 @@ class FlashMapMLP(nn.Module):
 
 
 class FlashMapDiTLayer(GradientCheckpointingLayer):
+    # project_context also uses the layer's parameters, outside forward:
+    # apply_fully_sharded registers it with FSDP like forward.
+    fsdp_forward_methods = ("project_context",)
+
     def __init__(
         self,
         hidden_size: int,
@@ -185,6 +190,13 @@ class FlashMapDiTLayer(GradientCheckpointingLayer):
         self.cross_attn = FlashMapAttention(hidden_size, num_heads, eps=qk_norm_eps)
         self.mlp_adaln = FlashMapAdaLNZero(hidden_size, cond_dim, adaln_eps)
         self.mlp = FlashMapMLP(hidden_size, intermediate_size)
+
+    def project_context(
+        self, context: torch.Tensor, rope: tuple[torch.Tensor, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Cross-attention keys/values of the context, computed once per
+        training forward and reused by every denoiser evaluation."""
+        return self.cross_attn.project_kv(context, rope)
 
     def forward(
         self,

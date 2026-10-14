@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from typing import ClassVar, NamedTuple
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.nn.attention.flex_attention import create_mask
 from transformers import PretrainedConfig
@@ -73,6 +74,8 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
 
     config_class: ClassVar[type[FlashMapSpeculatorConfig]] = FlashMapSpeculatorConfig  # type: ignore[misc]
     supports_gradient_checkpointing = True
+    # Norm gains are stored as 1 + scale: weight decay applies to matrices only.
+    weight_decay_on_vectors = False
     _no_split_modules = ["FlashMapDiTLayer"]
     # Verifier-owned weights are reloaded from the verifier, never serialized.
     _keys_to_ignore_on_load_missing: ClassVar[list[str]] = [  # type: ignore[misc]
@@ -151,10 +154,14 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
 
         # The DiT denoiser.
         self.x_embed = nn.Linear(hidden_size, dit_size)
-        self.time_embed = FlashMapTimestepEmbedding(cond_dim, cond_dim)
+        frequency_dim = config.timestep_frequency_dim or cond_dim
+        self.time_embed = FlashMapTimestepEmbedding(cond_dim, frequency_dim)
         if config.flow_map:
             # Zero output: a map initialized from its flow starts as the flow.
-            self.jump_embed = FlashMapTimestepEmbedding(cond_dim, cond_dim)
+            # Its first layer keeps PyTorch's default init (DeepSpec adds this
+            # embedding after the model's own initialization).
+            self.jump_embed = FlashMapTimestepEmbedding(cond_dim, frequency_dim)
+            self.jump_embed.linear_1._is_hf_initialized = True  # type: ignore[assignment]  # noqa: SLF001
             self.jump_embed.linear_2.flashmap_zero_init = True  # type: ignore[assignment]
         self.layers = nn.ModuleList(
             [
@@ -234,8 +241,23 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
                     f"teacher's {model.target_layer_ids}; the flow map reads the "
                     "teacher's layers."
                 )
-            return model
+        else:
+            model = cls._flow_from_training_args(verifier_config, t2d, d2t, **kwargs)
+        # The trainer seeds every rank alike; data-parallel ranks should not also
+        # share their anchors, times and noise.
+        seed = kwargs.get("seed")
+        if seed is not None and dist.is_available() and dist.is_initialized():
+            torch.manual_seed(seed + dist.get_rank())
+        return model
 
+    @classmethod
+    def _flow_from_training_args(
+        cls,
+        verifier_config: PretrainedConfig,
+        t2d: torch.Tensor | None,
+        d2t: torch.Tensor | None,
+        **kwargs,
+    ) -> "FlashMapDraftModel":
         # transformer_layer_config describes the DiT; the verifier's hidden size
         # is target_hidden_size.
         dit_size = kwargs.get("dit_hidden_size", 2048)
@@ -316,20 +338,30 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
 
     def attach_teacher(self, teacher: "FlashMapDraftModel") -> None:
         """Keep a frozen flow to distil from, outside ``parameters()`` and
-        ``state_dict()``: a checkpoint holds exactly the trained network."""
+        ``state_dict()``: a checkpoint holds exactly the trained network.
+
+        The teacher reads and writes the vocabulary through the same frozen
+        verifier matrices, so it shares this model's, and it runs in this model's
+        dtype."""
+        teacher.embed_tokens = self.embed_tokens
+        teacher.lm_head = teacher.verifier_lm_head = self.lm_head
+        teacher.to(dtype=self.fc.weight.dtype)  # type: ignore[call-arg]
         teacher.requires_grad_(False).eval()
         self._teacher = [teacher]
 
     @staticmethod
     def get_trainer_kwargs(**kwargs) -> tuple[dict, dict]:
         """Training and validation kwargs (the same for both stages)."""
+        # 0 (or less) turns the slot decay off.
+        gamma = kwargs.get("dflash_decay_gamma")
         shared = {
             "loss_config": resolve_loss_config(
                 kwargs.get("loss_fn") or "kl_div",
                 kwargs.get("loss_implementation", "fused"),
             ),
-            "gamma": kwargs.get("dflash_decay_gamma") or 7.0,
-            "max_anchors": kwargs.get("max_anchors", 512),
+            "gamma": 7.0 if gamma is None else gamma,
+            "max_anchors": kwargs.get("max_anchors")
+            or (128 if kwargs.get("flashmap_teacher") else 512),
             "diagonal_fraction": kwargs.get("diagonal_fraction", 0.5),
             "boundary_prob": kwargs.get("boundary_prob", 0.0625),
             "antithetic_sampling": kwargs.get("antithetic_sampling", True),
@@ -390,7 +422,7 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
         )
         rope = rope_cos_sin(context_position_ids, self.head_dim, self.rope_theta)
         return [
-            layer.cross_attn.project_kv(context, rope)  # type: ignore[union-attr,operator]
+            layer.project_context(context, rope)  # type: ignore[operator]
             for layer in self.layers
         ]
 
@@ -708,13 +740,11 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
             return draws
 
         num_diagonal = int(num_blocks * diagonal_fraction)
-        num_boundary = (
-            int(
-                num_blocks
-                * (diagonal_fraction + (1.0 - diagonal_fraction) * boundary_prob)
-            )
-            - num_diagonal
-        )
+        # Stochastically rounded, so that a small batch still trains the
+        # boundary pair at the expected rate.
+        expected = num_blocks * (1.0 - diagonal_fraction) * boundary_prob
+        num_boundary = int(expected) + int(torch.rand(()).item() < expected % 1)
+        num_boundary = min(num_boundary, num_blocks - num_diagonal)
         kind = torch.full((num_blocks,), OFF_DIAGONAL, dtype=torch.long, device=device)
         kind[:num_diagonal] = DIAGONAL
         kind[num_diagonal : num_diagonal + num_boundary] = BOUNDARY

@@ -32,7 +32,9 @@ VLLM_PORT=8000
 MAX_SAMPLES=5000
 SEQ_LENGTH=4096
 CONCURRENCY=32
-TARGET_LAYER_IDS="2 10 18 26 34"  # Must match vLLM's eagle_aux_hidden_state_layer_ids
+# Must match vLLM's eagle_aux_hidden_state_layer_ids: hidden_states[i] entering
+# decoder layer i (DeepSpec's target_layer_ids [1, 9, 17, 25, 33] plus one).
+TARGET_LAYER_IDS="2 10 18 26 34"
 
 # Stage 1: the flow (the released recipe: AdamW with beta2 0.95, weight decay 0.1,
 # 512 anchors).

@@ -46,6 +46,8 @@ torchrun --standalone --nproc_per_node 8 -m speculators.train \
     --max-anchors 128 --epochs 12
 ```
 
+`--target-layer-ids` follows the speculators/vLLM convention used by `launch_vllm.py` and the vLLM plugin (`eagle_aux_hidden_state_layer_ids`): id `i` is the hidden state entering decoder layer `i`, i.e. `hidden_states[i]` of a Hugging Face forward. The released Qwen3-8B and Qwen3-4B drafters read `2 10 18 26 34`; their DeepSpec configs list the same layers as `target_layer_ids = [1, 9, 17, 25, 33]` (decoder-layer outputs, `hidden_states[i + 1]`), which `speculators convert --algorithm flashmap` shifts by one. Use the same ids for data generation and both training stages; stage 2 takes them from the teacher and rejects a different `--target-layer-ids`.
+
 The released recipe trains both stages with AdamW and `beta2 = 0.95` (the default 0.999 let the flow's loss spike on a 500k-sample run). The flow map holds several vocabulary-sized states per draft slot during a step (the teacher's target and two half-jumps), so it is trained with fewer anchors than the flow. See `examples/train/flashmap_qwen3_8b_two_stage_offline.sh` for the full pipeline.
 
 ## Key Parameters

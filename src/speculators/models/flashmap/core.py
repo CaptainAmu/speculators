@@ -221,12 +221,20 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
         """
         teacher_path = kwargs.get("flashmap_teacher")
         if teacher_path:
-            return cls.from_teacher(
+            model = cls.from_teacher(
                 teacher_path,
                 t2d=t2d,
                 d2t=d2t,
                 draft_attn_impl=kwargs.get("draft_attn_impl"),
             )
+            requested = kwargs.get("target_layer_ids")
+            if requested is not None and list(requested) != model.target_layer_ids:
+                raise ValueError(
+                    f"--target-layer-ids {list(requested)} differ from the "
+                    f"teacher's {model.target_layer_ids}; the flow map reads the "
+                    "teacher's layers."
+                )
+            return model
 
         # transformer_layer_config describes the DiT; the verifier's hidden size
         # is target_hidden_size.

@@ -12,10 +12,13 @@ are accepted:
   projections are split into ``k_proj``/``v_proj``, and the target's frozen
   ``embed_tokens``/``lm_head`` copies are dropped (they are the verifier's).
 
-Optionally the draft head is restricted to the verifier's most frequent tokens:
+The draft head can be restricted to the verifier's most frequent tokens:
 ``draft_vocab_file`` holds a ranking (safetensors key ``ids``) and the first
 ``draft_vocab_size`` of its ids become the draft vocabulary, stored as the
-speculators ``d2t``/``t2d`` mappings.
+speculators ``d2t``/``t2d`` mappings. A release folder ships its ranking as
+``draft_vocab.safetensors``, from which the first ``DEFAULT_DRAFT_VOCAB_SIZE``
+ids are taken unless ``draft_vocab_size`` says otherwise (0 or the verifier's
+vocabulary size keeps the full vocabulary).
 """
 
 import json
@@ -36,7 +39,11 @@ from speculators.models.flashmap import FlashMapSpeculatorConfig
 from speculators.models.flashmap.config import DEFAULT_TIME_GRIDS
 from speculators.proposals.greedy import GreedyTokenProposalConfig
 
-__all__ = ["FlashMapConverter", "deepspec_to_canonical"]
+__all__ = ["DEFAULT_DRAFT_VOCAB_SIZE", "FlashMapConverter", "deepspec_to_canonical"]
+
+# Draft vocabulary taken from a release folder's draft_vocab.safetensors.
+DEFAULT_DRAFT_VOCAB_SIZE = 65536
+RELEASE_DRAFT_VOCAB = "draft_vocab.safetensors"
 
 # Weights the verifier provides at runtime.
 _VERIFIER_KEYS = frozenset({"embed_tokens.weight", "lm_head.weight"})
@@ -125,9 +132,17 @@ class FlashMapConverter:
         logger.info(f"Loaded {len(weights)} weights")
 
         config = self._build_config(source_config, weights, base_model, num_steps)
-        if draft_vocab_size is not None and draft_vocab_size < config.target_vocab_size:
+        if draft_vocab_file is None and (local_path / RELEASE_DRAFT_VOCAB).exists():
+            draft_vocab_file = str(local_path / RELEASE_DRAFT_VOCAB)
+            if draft_vocab_size is None:
+                draft_vocab_size = DEFAULT_DRAFT_VOCAB_SIZE
+        if draft_vocab_size and draft_vocab_size < config.target_vocab_size:
             if draft_vocab_file is None:
                 raise ValueError("draft_vocab_size needs a draft_vocab_file ranking")
+            logger.info(
+                f"Draft vocabulary: the first {draft_vocab_size} tokens of "
+                f"{draft_vocab_file}"
+            )
             weights.update(
                 self._draft_vocab(draft_vocab_file, draft_vocab_size, config)
             )
@@ -180,7 +195,11 @@ class FlashMapConverter:
             "head_dim": head_dim,
             "intermediate_size": intermediate,
             "hidden_act": "gelu",
-            "rms_norm_eps": float(source.get("rms_norm_eps", 1e-6)),
+            # FlashMap's RMSNorms all use 1e-6 (a DeepSpec config's rms_norm_eps
+            # is the target's).
+            "rms_norm_eps": float(source.get("rms_norm_eps", 1e-6))
+            if released
+            else 1e-6,
             "rope_parameters": {
                 "rope_type": "default",
                 # The released config's rope_theta is the DiT's; a DeepSpec

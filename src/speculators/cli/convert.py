@@ -61,7 +61,11 @@ def convert(
                 'Options for Eagle3: {"norm_before_residual": true, '
                 '"eagle_aux_hidden_state_layer_ids": [1,23,44]}. '
                 'Options for MTP: {"num_speculative_steps": 3}. '
-                'Options for DFlash: {"aux_hidden_state_layer_ids": [2,10,18,26,34]}.'
+                'Options for DFlash: {"aux_hidden_state_layer_ids": [2,10,18,26,34]}. '
+                'Options for FlashMap: {"draft_vocab_size": 65536, '
+                '"draft_vocab_file": "ranking.safetensors", "num_steps": 1}; a '
+                "release folder's draft_vocab.safetensors gives a 65536-token draft "
+                'vocabulary by default, {"draft_vocab_size": 0} keeps the full one.'
             ),
         ),
     ] = None,

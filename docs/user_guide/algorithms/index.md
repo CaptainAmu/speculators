@@ -28,7 +28,7 @@ Extends DFlash with a causal refiner resolved by Jacobi iteration, giving each d
 
 ## [FlashMap](flashmap.md)
 
-Drafts a whole block in one pass of a DiT distilled from a discrete flow, starting from noise over the vocabulary, with DFlash's conditioning. Served in vLLM through a plugin shipped with Speculators.
+Drafts a whole block in one pass of a DiT distilled from a discrete flow, starting from noise over the vocabulary, with DFlash's conditioning. Served in vLLM through a plugin shipped with Speculators. Trained in two stages (the flow, then the map distilled from it); see [Training FlashMap](flashmap_training.md).
 
 ## [MTP](mtp.md)
 

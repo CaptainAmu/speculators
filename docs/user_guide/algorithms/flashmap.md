@@ -111,11 +111,16 @@ with `TEMPERATURE=1` and `CONCURRENCY="1 16"` for the second.
 
 A FlashMap draft step (GPU time, CUDA graphs) takes 1.59 / 2.01 / 3.78 ms at batch 1 / 4 / 16, against 2.65 / 3.13 / 7.01 ms for DFlash. Two jumps (`FLASHMAP_NUM_STEPS=2`, exact, with a vocabulary-sized state between the jumps) raise the acceptance length (GSM8K 7.68, HumanEval 6.31, MT-Bench 4.19 at concurrency 1) but cost 5.2 ms per draft step, so one jump is faster end to end on this GPU.
 
+## Training
+
+FlashMap is trained with `speculators train --speculator-type flashmap` in two stages: the flow, then the flow map distilled from it (`--flashmap-teacher`). The flow map's checkpoints are in the layout served above. See [Training FlashMap](flashmap_training.md).
+
 ## Research & Citation
 
 FlashMap distills its drafter from a discrete flow following [Flow Map Language Models](https://arxiv.org/abs/2602.16813).
 
 ## See Also
 
+- [Training FlashMap](flashmap_training.md) -- The two training stages through `speculators train`
 - [DFlash](dflash.md) -- The block-parallel drafter whose runtime FlashMap reuses
 - [DSpark](dspark.md) -- DFlash with a Markov head, sharing FlashMap's block layout

@@ -50,19 +50,19 @@ The released recipe trains both stages with AdamW and `beta2 = 0.95` (the defaul
 
 ## Key Parameters
 
-| Parameter                 | Default | Description                                                                   |
-| ------------------------- | ------- | ----------------------------------------------------------------------------- |
-| `--flashmap-teacher`      | unset   | Stage 2: the stage-1 flow checkpoint to initialize and distil the map from    |
-| `--num-layers`            | 6       | DiT blocks (stage 1; stage 2 copies the teacher)                              |
-| `--dit-hidden-size`       | 2048    | DiT width (stage 1)                                                           |
-| `--dit-num-heads`         | 16      | DiT attention heads (stage 1)                                                 |
-| `--timestep-embed-dim`    | 256     | Width of the time embeddings that drive AdaLN (stage 1)                       |
-| `--block-size`            | 16      | Draft tokens per block                                                        |
-| `--dflash-decay-gamma`    | 7       | Per-slot loss decay                                                           |
-| `--diagonal-fraction`     | 0.5     | Stage 2: fraction of blocks matched to the frozen flow on the diagonal        |
-| `--boundary-prob`         | 0.0625  | Stage 2: fraction of the off-diagonal blocks trained on the drafting jump     |
-| `--antithetic-sampling`   | enabled | Stage 2: stratify the time draws over the batch                               |
-| `--loss-fn`               | kl_div  | Stage 2 divergence to the map's target (stage 1 is cross-entropy to the data) |
+| Parameter               | Default | Description                                                                   |
+| ----------------------- | ------- | ----------------------------------------------------------------------------- |
+| `--flashmap-teacher`    | unset   | Stage 2: the stage-1 flow checkpoint to initialize and distil the map from    |
+| `--num-layers`          | 6       | DiT blocks (stage 1; stage 2 copies the teacher)                              |
+| `--dit-hidden-size`     | 2048    | DiT width (stage 1)                                                           |
+| `--dit-num-heads`       | 16      | DiT attention heads (stage 1)                                                 |
+| `--timestep-embed-dim`  | 256     | Width of the time embeddings that drive AdaLN (stage 1)                       |
+| `--block-size`          | 16      | Draft tokens per block                                                        |
+| `--dflash-decay-gamma`  | 7       | Per-slot loss decay                                                           |
+| `--diagonal-fraction`   | 0.5     | Stage 2: fraction of blocks matched to the frozen flow on the diagonal        |
+| `--boundary-prob`       | 0.0625  | Stage 2: fraction of the off-diagonal blocks trained on the drafting jump     |
+| `--antithetic-sampling` | enabled | Stage 2: stratify the time draws over the batch                               |
+| `--loss-fn`             | kl_div  | Stage 2 divergence to the map's target (stage 1 is cross-entropy to the data) |
 
 FlashMap trains over the verifier's full vocabulary (`--draft-vocab-size` is not supported); a restricted vocabulary is a serving-time option.
 

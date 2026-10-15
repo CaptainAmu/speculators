@@ -10,6 +10,7 @@ from speculators.models.flashmap.vllm.fold import (
     fold_head,
     fold_noise,
     noise_factor,
+    quantize_fp8_per_channel,
     split_argmax,
 )
 
@@ -81,3 +82,19 @@ def test_time_grids_are_validated():
         FlashMapSpeculatorConfig(time_grids=[[0.0, 0.5]])
     with pytest.raises(ValueError, match="num_steps"):
         FlashMapSpeculatorConfig(num_steps=5)
+
+
+def test_quantize_fp8_per_channel():
+    generator = torch.Generator().manual_seed(4)
+    weight = (
+        torch.randn(32, 64, generator=generator) * torch.linspace(0.01, 10, 32)[:, None]
+    )
+    w_q, scale = quantize_fp8_per_channel(weight)
+    assert w_q.shape == (64, 32)
+    assert w_q.dtype == torch.float8_e4m3fn
+    assert scale.shape == (32, 1)
+    restored = w_q.t().float() * scale
+    # e4m3 keeps 3 mantissa bits: a relative error of at most 2^-4 per entry.
+    torch.testing.assert_close(
+        restored, weight, rtol=0.07, atol=1e-3 * scale.max().item()
+    )

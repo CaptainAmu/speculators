@@ -21,7 +21,8 @@
 # SERVERS entries are <label>=none | <label>=<method>:<draft>[:<env>=<value>...],
 #   <method> one of dflash, flashmap. Trailing <env>=<value> pairs are exported
 #   for that server only, e.g. fm2=flashmap:./FlashMap-Qwen3-8B:FLASHMAP_NUM_STEPS=2
-#   or fm8=flashmap:./FlashMap-Qwen3-8B:NUM_SPEC=8 (verify 8 of the 16 drafts).
+#   or fm8=flashmap:./FlashMap-Qwen3-8B:NUM_SPEC=8 (verify 8 of the 16 drafts)
+#   or fmkv=flashmap:./FlashMap-Qwen3-8B:DRAFT_KV_DTYPE=fp8_e4m3 (fp8 draft KV cache).
 # Requests sample at TEMPERATURE with no top-k/top-p (--generation-config vllm
 #   ignores the model's sampling defaults); above 0, drafts are sampled too
 #   ("draft_sample_method": "probabilistic").
@@ -79,15 +80,17 @@ run_server() {
         IFS=: read -r -a parts <<< "$spec"
         local method="${parts[0]}" draft="${parts[1]}"
         envs=("${parts[@]:2}")
-        local num_spec=$NUM_SPEC
+        local num_spec=$NUM_SPEC kv_dtype=""
         for pair in "${envs[@]}"; do
             [[ "$pair" == NUM_SPEC=* ]] && num_spec="${pair#NUM_SPEC=}"
+            [[ "$pair" == DRAFT_KV_DTYPE=* ]] && kv_dtype="${pair#DRAFT_KV_DTYPE=}"
         done
         # A FlashMap block is all drafts; a DFlash block's first slot is the anchor.
         [[ "$method" == "dflash" ]] && num_spec=$(( num_spec - 1 ))
         # FlashMap runs on vLLM's DFlash runtime.
         local spec_json="{\"model\": \"$draft\", \"method\": \"dflash\""
         spec_json+=", \"num_speculative_tokens\": $num_spec"
+        [[ -n "$kv_dtype" ]] && spec_json+=", \"kv_cache_dtype\": \"$kv_dtype\""
         if [[ "$TEMPERATURE" != "0" ]]; then
             spec_json+=", \"draft_sample_method\": \"probabilistic\""
         fi

@@ -14,6 +14,7 @@ import triton.language as tl
 
 __all__ = [
     "block_self_attention",
+    "consensus_path",
     "rms_norm",
     "rms_norm_rope",
     "rope_table",
@@ -240,6 +241,7 @@ def _write_context_kv_kernel(
     k_norm_ptr,  # (L, D)
     cos_sin_ptr,  # (max_positions, D / 2, 2) float32
     cache_ptrs,  # (L,) int64 data pointers of each layer's KV cache
+    scales_ptr,  # (L, 2) float32 key and value scales of an fp8 cache
     eps,
     block_size,
     stride_block,
@@ -247,6 +249,7 @@ def _write_context_kv_kernel(
     stride_token,
     v_offset,
     L: tl.constexpr,
+    FP8: tl.constexpr,
     H: tl.constexpr,
     D: tl.constexpr,
 ):
@@ -275,12 +278,26 @@ def _write_context_kv_kernel(
     cos = tl.load(cos_sin_ptr + pos * D + 2 * i)
     sin = tl.load(cos_sin_ptr + pos * D + 2 * i + 1)
 
-    cache = tl.load(cache_ptrs + layer).to(tl.pointer_type(tl.bfloat16))
+    key_out = even * cos - odd * sin
+    key_odd_out = odd * cos + even * sin
+    values = tl.load(v_row + d)
+    if FP8:
+        # e4m3 with per-tensor scales, as vLLM's fp8 KV caches store them.
+        k_scale = tl.load(scales_ptr + layer * 2)
+        v_scale = tl.load(scales_ptr + layer * 2 + 1)
+        cache = tl.load(cache_ptrs + layer).to(tl.pointer_type(tl.float8e4nv))
+        key_out = (key_out / k_scale).to(tl.float8e4nv)
+        key_odd_out = (key_odd_out / k_scale).to(tl.float8e4nv)
+        values = (values.to(tl.float32) / v_scale).to(tl.float8e4nv)
+    else:
+        cache = tl.load(cache_ptrs + layer).to(tl.pointer_type(tl.bfloat16))
+        key_out = key_out.to(tl.bfloat16)
+        key_odd_out = key_odd_out.to(tl.bfloat16)
     dst = cache + (slot // block_size) * stride_block + h * stride_head
     dst += (slot % block_size) * stride_token
-    tl.store(dst + 2 * i, (even * cos - odd * sin).to(tl.bfloat16))
-    tl.store(dst + 2 * i + 1, (odd * cos + even * sin).to(tl.bfloat16))
-    tl.store(dst + v_offset + d, tl.load(v_row + d))
+    tl.store(dst + 2 * i, key_out)
+    tl.store(dst + 2 * i + 1, key_odd_out)
+    tl.store(dst + v_offset + d, values)
 
 
 def write_context_kv(
@@ -293,6 +310,7 @@ def write_context_kv(
     cache_strides: tuple[int, int, int, int],
     block_size: int,
     eps: float,
+    scales: torch.Tensor | None = None,
 ) -> None:
     """Write every layer's context keys (k-normed and rotated) and values for
     ``kv (tokens, layers, 2, heads, head_dim)`` into the paged KV caches at
@@ -300,6 +318,8 @@ def write_context_kv(
 
     ``cache_strides`` are ``(block, head, token, value offset)`` in elements of
     the vLLM FlashAttention cache ``(blocks, heads, block_size, 2 * head_dim)``.
+    With ``scales (layers, 2)`` (each layer's key and value scale) the caches are
+    e4m3 and store ``key / k_scale`` and ``value / v_scale``.
     """
     tokens, layers, _, heads, head_dim = kv.shape
     if not tokens:
@@ -312,6 +332,7 @@ def write_context_kv(
         k_norm,
         cos_sin,
         cache_ptrs,
+        scales if scales is not None else k_norm,
         eps,
         block_size,
         stride_block,
@@ -319,6 +340,7 @@ def write_context_kv(
         stride_token,
         v_offset,
         L=layers,
+        FP8=scales is not None,
         H=heads,
         D=head_dim,
     )
@@ -420,3 +442,45 @@ def scatter_rows(
             dst.stride(1),
             BLOCK=block,
         )
+
+
+@triton.jit
+def _consensus_path_kernel(
+    tokens_ptr,  # (requests, N, K) int64
+    out_ptr,  # (requests, K) int64
+    N: tl.constexpr,
+    NP: tl.constexpr,
+    K: tl.constexpr,
+):
+    # One program per request: walk the candidates' trie from the root, taking
+    # at each depth the child that most surviving candidates share.
+    request = tl.program_id(0).to(tl.int64)
+    c = tl.arange(0, NP)
+    alive = c < N
+    for d in tl.static_range(K):
+        tok = tl.load(tokens_ptr + (request * N + c) * K + d, mask=c < N, other=-1)
+        same = (tok[:, None] == tok[None, :]) & alive[None, :]
+        counts = tl.sum(same.to(tl.int32), axis=1)
+        # Most votes first, then the lowest candidate index.
+        score = tl.where(alive, counts * NP + (NP - 1 - c), -1)
+        best = tl.argmax(score, axis=0)
+        chosen = tl.sum(tl.where(c == best, tok, 0), axis=0)
+        tl.store(out_ptr + request * K + d, chosen)
+        alive = alive & (tok == chosen)
+
+
+def consensus_path(tokens: torch.Tensor) -> torch.Tensor:
+    """For ``tokens (requests, N, K)``, the root-to-leaf path of the candidates'
+    trie that at every depth follows the child the most of the candidates still
+    on the path share (ties to the lowest candidate). Returns ``(requests, K)``."""
+    requests, candidates, length = tokens.shape
+    out = torch.empty(requests, length, dtype=tokens.dtype, device=tokens.device)
+    if requests:
+        _consensus_path_kernel[(requests,)](
+            tokens.contiguous(),
+            out,
+            N=candidates,
+            NP=max(2, triton.next_power_of_2(candidates)),
+            K=length,
+        )
+    return out

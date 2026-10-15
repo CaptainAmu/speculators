@@ -23,6 +23,7 @@ __all__ = [
     "fold_head",
     "fold_noise",
     "noise_factor",
+    "quantize_fp8_per_channel",
     "split_argmax",
     "timestep_embedding",
 ]
@@ -97,6 +98,20 @@ def fold_head(
         weight[start : start + chunk] = (part @ head_weight).to(lm_head.dtype)
         bias[start : start + chunk] = (part @ head_bias).to(lm_head.dtype)
     return weight, bias
+
+
+@torch.no_grad()
+def quantize_fp8_per_channel(
+    weight: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(w_q, scale)`` for a ``(N, K)`` weight: ``w_q (K, N)`` in ``dtype`` (a
+    column-major view, as scaled-mm kernels take it) and ``scale (N, 1)`` in
+    float32 with ``weight ~= (w_q.T * scale)``, one scale per output channel."""
+    finfo = torch.finfo(dtype)
+    w = weight.float()
+    scale = w.abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / finfo.max
+    w_q = (w / scale).clamp(finfo.min, finfo.max).to(dtype)
+    return w_q.t(), scale.contiguous()
 
 
 def split_argmax(logits: torch.Tensor, chunks: int = 128) -> torch.Tensor:

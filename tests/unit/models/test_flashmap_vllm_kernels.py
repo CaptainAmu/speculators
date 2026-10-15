@@ -9,6 +9,7 @@ if not torch.cuda.is_available():
 
 from speculators.models.flashmap.vllm.kernels import (
     block_self_attention,
+    consensus_path,
     rms_norm,
     rms_norm_rope,
     rope_table,
@@ -151,3 +152,70 @@ def test_scatter_rows():
     scatter_rows(src, req, col, ids, dst)
     assert torch.equal(dst[2, 1, ids], src[0])
     assert torch.isinf(dst).sum() == 3 * 2 * 10 - 4
+
+
+def test_write_context_kv_fp8():
+    layers, heads, head_dim, block_size, num_blocks = 2, 2, 128, 4, 3
+    kv = _bf16(3, layers, 2, heads, head_dim)
+    positions = torch.tensor([0, 5, 7], device=DEVICE)
+    slots = torch.tensor([0, 5, 11], device=DEVICE)
+    k_norm = (1 + 0.1 * _bf16(layers, head_dim, seed=3)).float()
+    cos_sin = rope_table(16, head_dim, 10000.0, DEVICE)
+    scales = torch.tensor([[0.5, 2.0], [1.0, 1.0]], device=DEVICE)
+    caches = [
+        torch.zeros(
+            num_blocks,
+            heads,
+            block_size,
+            2 * head_dim,
+            device=DEVICE,
+            dtype=torch.uint8,
+        )
+        for _ in range(layers)
+    ]
+    key, _ = caches[0].transpose(1, 2).split(head_dim, dim=-1)
+    strides = (key.stride(0), key.stride(2), key.stride(1), head_dim)
+    ptrs = torch.tensor([c.data_ptr() for c in caches], device=DEVICE)
+    write_context_kv(
+        kv, positions, slots, k_norm, cos_sin, ptrs, strides, block_size, 1e-5, scales
+    )
+    for layer, cache in enumerate(caches):
+        cache = cache.view(torch.float8_e4m3fn)
+        for i, slot in enumerate(slots.tolist()):
+            entry = cache[slot // block_size, :, slot % block_size].float()
+            expected_k = _rope_ref(
+                _rms_ref(kv[i, layer, 0][None], k_norm[layer], 1e-5),
+                cos_sin,
+                positions[i : i + 1],
+            )[0].float()
+            k_scale, v_scale = scales[layer].tolist()
+            torch.testing.assert_close(
+                entry[:, :head_dim] * k_scale, expected_k, atol=0.1, rtol=0.07
+            )
+            torch.testing.assert_close(
+                entry[:, head_dim:] * v_scale,
+                kv[i, layer, 1].float(),
+                atol=0.1,
+                rtol=0.07,
+            )
+
+
+def _consensus_ref(candidates):
+    alive = list(range(len(candidates)))
+    path = []
+    for d in range(len(candidates[0])):
+        votes = {}
+        for c in alive:
+            votes.setdefault(candidates[c][d], []).append(c)
+        token = max(votes, key=lambda t: (len(votes[t]), -votes[t][0]))
+        path.append(token)
+        alive = votes[token]
+    return path
+
+
+def test_consensus_path():
+    generator = torch.Generator(device=DEVICE).manual_seed(5)
+    for n in (1, 3, 8):
+        tokens = torch.randint(0, 3, (4, n, 16), generator=generator, device=DEVICE)
+        expected = [_consensus_ref(tokens[r].tolist()) for r in range(4)]
+        assert consensus_path(tokens).tolist() == expected

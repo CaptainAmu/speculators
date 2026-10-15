@@ -120,3 +120,21 @@ def test_build_config_from_deepspec():
     reloaded = SpeculatorModelConfig.from_dict(config.to_dict())
     assert isinstance(reloaded, FlashMapSpeculatorConfig)
     assert reloaded.time_grid(2) == DEFAULT_TIME_GRIDS[1]
+
+
+def test_draft_vocab_mapping(tmp_path):
+    from safetensors.torch import save_file  # noqa: PLC0415
+
+    ranking = torch.tensor([7, 3, 30, 1, 12, 0], dtype=torch.int64)
+    path = tmp_path / "draft_vocab.safetensors"
+    save_file({"ids": ranking}, str(path))
+    config = FlashMapSpeculatorConfig(
+        transformer_layer_config={"model_type": "qwen3", "vocab_size": 32}
+    )
+    mapping = FlashMapConverter._draft_vocab(str(path), 4, config)
+
+    hot = torch.tensor([1, 3, 7, 30])  # the first 4 ranked ids, sorted
+    assert torch.equal(torch.arange(4) + mapping["d2t"], hot)
+    assert mapping["t2d"].dtype == torch.bool
+    assert mapping["t2d"].sum() == 4
+    assert mapping["t2d"][hot].all()

@@ -17,6 +17,8 @@ __all__ = [
     "rms_norm",
     "rms_norm_rope",
     "rope_table",
+    "scatter_rows",
+    "seeded_normal",
     "write_context_kv",
 ]
 
@@ -43,9 +45,11 @@ def _rms_norm_kernel(x_ptr, weight_ptr, out_ptr, n_cols, eps, BLOCK: tl.constexp
     tl.store(out_ptr + row * n_cols + cols, (x * scale).to(tl.bfloat16), mask=mask)
 
 
+@torch.library.custom_op("flashmap::rms_norm", mutates_args=())
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """FlashMap RMSNorm of a contiguous bf16 ``x (..., C)``, in one launch."""
-    assert x.dtype == torch.bfloat16 and x.is_contiguous()
+    """FlashMap RMSNorm of a bf16 ``x (..., C)``, in one launch."""
+    assert x.dtype == torch.bfloat16
+    x = x.contiguous()
     out = torch.empty_like(x)
     n_cols = x.shape[-1]
     if x.numel():
@@ -53,6 +57,11 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
             x, weight, out, n_cols, eps, BLOCK=triton.next_power_of_2(n_cols)
         )
     return out
+
+
+@rms_norm.register_fake
+def _(x, weight, eps):
+    return torch.empty_like(x)
 
 
 @triton.jit
@@ -100,7 +109,8 @@ def rms_norm_rope(
     """RMSNorm then RoPE at ``positions (tokens,)`` of ``x (tokens, heads, head_dim)``
     with the ``rope_table`` ``cos_sin``, in one launch."""
     tokens, heads, head_dim = x.shape
-    assert x.is_contiguous() and cos_sin.dtype == torch.float32
+    assert cos_sin.dtype == torch.float32 and cos_sin.is_contiguous()
+    x, positions = x.contiguous(), positions.contiguous()
     out = torch.empty_like(x)
     if tokens:
         _rms_norm_rope_kernel[(tokens * heads,)](
@@ -194,7 +204,8 @@ def block_self_attention(
     ``qkv (blocks, T, 3, heads, head_dim)``: q/k RMSNorms, RoPE at ``positions
     (blocks * T,)``, softmax attention. Returns ``(blocks * T, heads * head_dim)``."""
     blocks, block_size, _, heads, head_dim = qkv.shape
-    assert qkv.is_contiguous() and cos_sin.dtype == torch.float32
+    assert cos_sin.dtype == torch.float32 and cos_sin.is_contiguous()
+    qkv, positions = qkv.contiguous(), positions.contiguous()
     out = torch.empty(
         (blocks * block_size, heads * head_dim), dtype=qkv.dtype, device=qkv.device
     )
@@ -295,9 +306,9 @@ def write_context_kv(
         return
     stride_block, stride_head, stride_token, v_offset = cache_strides
     _write_context_kv_kernel[(tokens, layers)](
-        kv,
-        positions,
-        slots,
+        kv.contiguous(),
+        positions.contiguous(),
+        slots.contiguous(),
         k_norm,
         cos_sin,
         cache_ptrs,
@@ -311,3 +322,101 @@ def write_context_kv(
         H=heads,
         D=head_dim,
     )
+
+
+@triton.jit
+def _seeded_normal_kernel(
+    seeds_ptr,  # (max_num_reqs,) int64
+    rows_ptr,  # (rows,) int32 request-state index per row; negative = unseeded
+    pos_ptr,  # (rows,)
+    out_ptr,  # (rows, n_cols) float32
+    n_cols,
+    scale,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    state = tl.load(rows_ptr + row)
+    seed = tl.load(seeds_ptr + tl.maximum(state, 0)).to(tl.int64)
+    seed = tl.where(state >= 0, seed, 0)
+    # Philox keyed by the request's seed and the row's position: the noise of a
+    # seeded request is reproducible whatever else is batched with it.
+    key = seed * 1000003 + tl.load(pos_ptr + row).to(tl.int64)
+    z = tl.randn(key, cols)
+    tl.store(out_ptr + row * n_cols + cols, z * scale, mask=cols < n_cols)
+
+
+def seeded_normal(
+    seeds: torch.Tensor,
+    rows: torch.Tensor,
+    positions: torch.Tensor,
+    n_cols: int,
+    scale: float = 1.0,
+) -> torch.Tensor:
+    """Standard normals ``(len(rows), n_cols)`` in float32, row ``i`` keyed by
+    ``seeds[rows[i]]`` (0 where ``rows[i] < 0``) and ``positions[i]``."""
+    out = torch.empty(rows.shape[0], n_cols, dtype=torch.float32, device=rows.device)
+    if rows.shape[0]:
+        block = 1024
+        _seeded_normal_kernel[(rows.shape[0], triton.cdiv(n_cols, block))](
+            seeds,
+            rows.contiguous(),
+            positions.contiguous(),
+            out,
+            n_cols,
+            scale,
+            BLOCK=block,
+        )
+    return out
+
+
+@triton.jit
+def _scatter_rows_kernel(
+    src_ptr,  # (rows, n_cols)
+    req_ptr,  # (rows,) first index into dst; negative = skip
+    col_ptr,  # (rows,) second index into dst
+    ids_ptr,  # (n_cols,) third index into dst
+    dst_ptr,  # (A, B, C), contiguous
+    n_cols,
+    stride_a,
+    stride_b,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    req = tl.load(req_ptr + row).to(tl.int64)
+    if req < 0:
+        return
+    col = tl.load(col_ptr + row).to(tl.int64)
+    j = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = j < n_cols
+    ids = tl.load(ids_ptr + j, mask=mask, other=0).to(tl.int64)
+    values = tl.load(src_ptr + row * n_cols + j, mask=mask)
+    dst = dst_ptr + req * stride_a + col * stride_b + ids
+    tl.store(dst, values.to(dst_ptr.dtype.element_ty), mask=mask)
+
+
+def scatter_rows(
+    src: torch.Tensor,
+    req: torch.Tensor,
+    col: torch.Tensor,
+    ids: torch.Tensor,
+    dst: torch.Tensor,
+) -> None:
+    """``dst[req[i], col[i], ids] = src[i]`` for every row ``i`` with
+    ``req[i] >= 0``: draft-vocabulary logits into a target-vocabulary cache."""
+    assert dst.is_contiguous()
+    assert dst.dim() == 3  # noqa: PLR2004
+    rows, n_cols = src.shape
+    if rows:
+        block = 1024
+        _scatter_rows_kernel[(rows, triton.cdiv(n_cols, block))](
+            src.contiguous(),
+            req.contiguous(),
+            col.contiguous(),
+            ids.contiguous(),
+            dst,
+            n_cols,
+            dst.stride(0),
+            dst.stride(1),
+            BLOCK=block,
+        )

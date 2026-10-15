@@ -3,16 +3,16 @@
 The model is driven by ``FlashMapSpeculator`` (speculator.py), which reuses
 vLLM's DFlash machinery: the target's aux hidden states are fused by ``fc``
 (``combine_hidden_states``) and every committed token's cross-attention keys and
-values are written to the draft's paged KV cache
-(``precompute_and_store_context_kv``); each draft step then runs ``forward`` on
+values go to the draft's paged KV cache; each draft step then runs ``forward`` on
 ``block_size`` query rows per request, laid out as in DSpark: row 0 carries the
-anchor token at the anchor position ``p`` and rows ``k`` sit at ``p + k``.
+anchor token at the anchor position ``p`` and row ``k`` sits at ``p + k``.
 
 A FlashMap draft step, for each request:
 
-* writes the anchor's keys/values (its embedding through ``anchor_proj`` and
-  ``anchor_norm``) into the KV cache at ``p``, where the target's own context
-  entry for that token lands once it is verified;
+* writes the keys/values of the context committed since the last step and of the
+  anchor (its embedding through ``anchor_proj`` and ``anchor_norm``, at ``p``,
+  where the target's own entry for that token lands once it is verified), all
+  projected by one GEMM over every layer's weights;
 * evaluates the DiT on ``block_size`` slots at positions ``p + 1 ..`` from noise,
   their cross-attention reading positions ``0 .. p`` straight from the paged KV
   cache with FlashAttention;
@@ -20,13 +20,23 @@ A FlashMap draft step, for each request:
   the DiT head folded into the target's LM head.
 
 One jump (the default) needs no vocabulary-sized tensor: the state at ``t = 0``
-embeds to a constant (its posterior is uniform) plus the noise's embedding
-``x0 @ E ~ N(0, E^T E)``, drawn as ``z @ A`` with ``A^T A = E^T E`` from
-``z ~ N(0, I)``. ``A = sqrt(Lambda) Q^T`` from ``E^T E = Q Lambda Q^T`` makes the
-RMS of the drawn embedding elementwise in ``z`` and lets ``A``, the noise norm's
-weight and ``x_embed`` fold into one ``(hidden, dim)`` matrix. Everything that
-depends only on the jump times (every AdaLN modulation) is computed once.
-More jumps run the reference algorithm exactly, with a vocabulary-sized state.
+embeds to a constant (its posterior is uniform) plus the noise's embedding,
+drawn in the embedding's eigenbasis (fold.py). Everything that depends only on
+the jump times (every AdaLN modulation) is computed once at load. More jumps
+run the reference algorithm exactly, with a vocabulary-sized state.
+
+Requirements: the V2 model runner, tensor parallel size 1, the FlashAttention
+backend and a bf16 KV cache (checked at load).
+
+``FLASHMAP_EXPERIMENTAL=1`` turns on draft-step changes that are not yet
+validated on a GPU: the committed context and the anchors projected by one GEMM
+(one read of the context K/V weight per step instead of two), a compiled
+prologue, one FlashAttention 3 tile schedule shared by every layer, noise keyed
+by each request's seed and position (seeded requests become reproducible at
+temperature > 0), a split argmax, and restricted-vocabulary sampling that writes
+the cached proposal distribution directly instead of through a
+vocabulary-sized buffer. ``FLASHMAP_NUM_STEPS`` overrides the checkpoint's
+number of jumps.
 """
 
 import os
@@ -36,22 +46,34 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from vllm.config import VllmConfig
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
 
+from speculators.models.flashmap.vllm.fold import (
+    fold_head,
+    fold_noise,
+    timestep_embedding,
+)
 from speculators.models.flashmap.vllm.kernels import (
     block_self_attention,
     rms_norm,
     rms_norm_rope,
     rope_table,
+    seeded_normal,
     write_context_kv,
 )
 
+try:
+    from vllm.vllm_flash_attn import get_scheduler_metadata
+except ImportError:  # no FlashAttention 3 build
+    get_scheduler_metadata = None
+
 logger = init_logger(__name__)
 
-__all__ = ["FlashMapDraftModel"]
+__all__ = ["FlashMapDraftModel", "FlashMapModel"]
 
 
 @torch.library.custom_op("flashmap::paged_cross_attention", mutates_args=())
@@ -61,6 +83,7 @@ def paged_cross_attention(
     cu_seqlens_q: torch.Tensor,
     seqused_k: torch.Tensor,
     block_table: torch.Tensor,
+    scheduler_metadata: torch.Tensor | None,
     max_seqlen_q: int,
     max_seqlen_k: int,
     softmax_scale: float,
@@ -81,6 +104,7 @@ def paged_cross_attention(
         softmax_scale=softmax_scale,
         causal=False,
         block_table=block_table,
+        scheduler_metadata=scheduler_metadata,
         fa_version=fa_version,
     )
 
@@ -88,17 +112,6 @@ def paged_cross_attention(
 @paged_cross_attention.register_fake
 def _(query, kv_cache, cu_seqlens_q, seqused_k, block_table, *args):
     return torch.empty_like(query)
-
-
-def timestep_embedding(t: torch.Tensor, dim: int, max_period: float = 10000.0):
-    half = dim // 2
-    freqs = torch.exp(
-        -torch.log(torch.tensor(max_period, device=t.device))
-        * torch.arange(half, dtype=torch.float32, device=t.device)
-        / half
-    )
-    args = t.float()[..., None] * freqs
-    return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
 
 
 class RMSNorm(nn.Module):
@@ -110,7 +123,7 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim), requires_grad=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return rms_norm(x.contiguous(), self.weight, self.eps)
+        return rms_norm(x, self.weight, self.eps)
 
 
 class TimestepEmbedding(nn.Module):
@@ -181,28 +194,15 @@ class FlashMapLayer(nn.Module):
         )
 
 
-class FlashMapDraftModel(nn.Module):
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
-        super().__init__()
-        speculative_config = vllm_config.speculative_config
-        assert speculative_config is not None
-        self.config = config = speculative_config.draft_model_config.hf_config
-        self.dtype = vllm_config.model_config.dtype
-        self.max_model_len = vllm_config.model_config.max_model_len
-        dim = config.hidden_size
-        target_hidden = config.target_hidden_size
-        num_aux = len(config.eagle_aux_hidden_state_layer_ids)
-        eps = config.rms_norm_eps
-        self.block_size = int(config.block_size)
-        self.num_steps = int(os.environ.get("FLASHMAP_NUM_STEPS", config.num_steps))
-        self.time_grid = [float(t) for t in config.time_grids[self.num_steps - 1]]
-        # Scales the starting noise (tests set 0 to compare deterministic drafts).
-        self.noise_scale = float(os.environ.get("FLASHMAP_NOISE_SCALE", "1"))
-        # Project the committed context together with the anchors (one GEMM over
-        # the context K/V weight per step instead of two), see defer_context_kv.
-        self.merge_anchor = os.environ.get("FLASHMAP_MERGE_ANCHOR", "0") == "1"
-        self._pending_context: tuple[torch.Tensor, ...] | None = None
+class FlashMapModel(nn.Module):
+    """The FlashMap weights under their canonical names. ``embed_tokens`` is the
+    target's, attached at load (``load_dflash_model``)."""
 
+    def __init__(self, config, vllm_config: VllmConfig, prefix: str, start: int):
+        super().__init__()
+        dim, target_hidden = config.hidden_size, config.target_hidden_size
+        eps = config.rms_norm_eps
+        num_aux = len(config.eagle_aux_hidden_state_layer_ids)
         self.fc = nn.Linear(num_aux * target_hidden, dim, bias=False)
         self.hidden_norm = RMSNorm(dim, eps)
         self.anchor_proj = nn.Linear(target_hidden, dim)
@@ -214,41 +214,90 @@ class FlashMapDraftModel(nn.Module):
         frequency_dim = getattr(config, "timestep_frequency_dim", None)
         self.time_embed = TimestepEmbedding(config.timestep_embed_dim, frequency_dim)
         self.jump_embed = TimestepEmbedding(config.timestep_embed_dim, frequency_dim)
-        start = vllm_config.model_config.get_total_num_hidden_layers()
-        model_prefix = f"{prefix}.model" if prefix else "model"
         self.layers = nn.ModuleList(
             [
-                FlashMapLayer(config, f"{model_prefix}.layers.{start + i}", vllm_config)
+                FlashMapLayer(config, f"{prefix}.layers.{start + i}", vllm_config)
                 for i in range(config.num_hidden_layers)
             ]
         )
         self.final_adaln = AdaLN(config.timestep_embed_dim, dim)
         self.head = nn.Linear(dim, target_hidden)
 
+
+class FlashMapDraftModel(nn.Module):
+    # Scales the starting noise; tests set 0 to compare deterministic drafts.
+    noise_scale = 1.0
+    # torch.compile the draft step's prologue and DiT (fuses elementwise chains).
+    compile = True
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
+        if get_tensor_model_parallel_world_size() != 1:
+            raise ValueError(
+                "FlashMap drafting supports tensor parallel size 1 only (its "
+                "load-time folds read the whole target embedding and LM head)."
+            )
+        if not vllm_config.use_v2_model_runner:
+            raise ValueError(
+                "FlashMap drafting needs vLLM's V2 model runner; unset "
+                "VLLM_USE_V2_MODEL_RUNNER=0."
+            )
+        speculative_config = vllm_config.speculative_config
+        assert speculative_config is not None
+        self.config = config = speculative_config.draft_model_config.hf_config
+        self.dtype = vllm_config.model_config.dtype
+        if self.dtype != torch.bfloat16:
+            raise ValueError(f"FlashMap drafting runs in bfloat16, not {self.dtype}")
+        self.max_model_len = vllm_config.model_config.max_model_len
+        self.block_size = int(config.block_size)
+        # Draft-step changes not yet validated on a GPU (see the module docstring).
+        self.experimental = os.environ.get("FLASHMAP_EXPERIMENTAL", "0") == "1"
+        # FLASHMAP_NUM_STEPS overrides the checkpoint's number of jumps.
+        self.num_steps = int(os.environ.get("FLASHMAP_NUM_STEPS", config.num_steps))
+        self.time_grid = [float(t) for t in config.time_grids[self.num_steps - 1]]
+        start = vllm_config.model_config.get_total_num_hidden_layers()
+        self.model = FlashMapModel(
+            config, vllm_config, f"{prefix}.model" if prefix else "model", start
+        )
         # Draft vocabulary: a restricted head drafts over d2t's tokens only.
-        vocab_size = int(config.vocab_size)
-        draft_vocab_size = int(getattr(config, "draft_vocab_size", None) or vocab_size)
-        self.d2t: torch.Tensor | None = None
-        if draft_vocab_size != vocab_size:
+        self.vocab_size = int(config.vocab_size)
+        draft_vocab_size = int(
+            getattr(config, "draft_vocab_size", None) or self.vocab_size
+        )
+        self.d2t: nn.Parameter | None = None
+        if draft_vocab_size != self.vocab_size:
             self.d2t = nn.Parameter(
                 torch.zeros(draft_vocab_size, dtype=torch.long), requires_grad=False
             )
-        self.vocab_size = vocab_size
-        self._compiled = None
-        self._compiled_noise = None
+        self._pending_context: tuple[torch.Tensor, ...] | None = None
+        self._cache_args = None
+        self._noise_keys: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    @property
+    def layers(self) -> nn.ModuleList:
+        return self.model.layers
 
     # ------------------------------------------------------------------ loading
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params = dict(self.named_parameters())
         loaded = set()
-        for name, tensor in weights:
-            if name in ("embed_tokens.weight", "lm_head.weight", "t2d"):
+        for checkpoint_name, tensor in weights:
+            if checkpoint_name in ("embed_tokens.weight", "lm_head.weight", "t2d"):
                 continue  # the target's own, shared at load
+            name = (
+                checkpoint_name
+                if checkpoint_name == "d2t"
+                else "model." + (checkpoint_name)
+            )
             param = params.get(name)
             if param is None:
-                raise ValueError(f"unexpected FlashMap weight {name!r}")
-            assert param.shape == tensor.shape, (name, param.shape, tensor.shape)
+                raise ValueError(f"unexpected FlashMap weight {checkpoint_name!r}")
+            if param.shape != tensor.shape:
+                raise ValueError(
+                    f"FlashMap weight {checkpoint_name!r} has shape "
+                    f"{tuple(tensor.shape)}, expected {tuple(param.shape)}"
+                )
             param.data.copy_(tensor)
             loaded.add(name)
         # The attention layers' own (KV-cache scale) parameters are not weights.
@@ -258,28 +307,25 @@ class FlashMapDraftModel(nn.Module):
         return set(params)
 
     @torch.no_grad()
-    def prepare(self, embed_tokens: torch.Tensor, lm_head: torch.Tensor) -> None:  # noqa: C901
-        """Precompute what the draft step needs from the target's embedding
-        ``(vocab, hidden)`` and LM head and from the fixed jump times."""
-        device = self.fc.weight.device
-        dtype = self.dtype
-        embed_tokens = embed_tokens[: self.vocab_size]
-        lm_head = lm_head[: self.vocab_size]
-        self.embed_tokens = embed_tokens
-        layer0 = self.layers[0]
-        attn = layer0.cross_attn
+    def prepare(self) -> None:  # noqa: C901
+        """Precompute what the draft step needs, once the target's embedding
+        (``model.embed_tokens``) and LM head (``lm_head``) are attached."""
+        model = self.model
+        embed_tokens = model.embed_tokens.weight[: self.vocab_size]
+        lm_head = self.lm_head.weight[: self.vocab_size]
+        device, dtype = model.fc.weight.device, self.dtype
+        attn = self.layers[0].cross_attn
         self.num_heads, self.head_dim = attn.num_heads, attn.head_dim
         self.dim = self.num_heads * self.head_dim
         self.softmax_scale = self.head_dim**-0.5
-        self.fa_version = attn.attn.impl.vllm_flash_attn_version
+        self._check_attention()
 
         # AdaLN modulations for each jump (s, t) of the grid.
-        self.modulations = []
-        self.final_modulations = []
+        self.modulations, self.final_modulations = [], []
         grid = torch.tensor(self.time_grid, device=device, dtype=torch.float32)
         scale = float(self.config.time_scale)
         for step in range(self.num_steps):
-            cond = self.time_embed(grid[step : step + 1] * scale) + self.jump_embed(
+            cond = model.time_embed(grid[step : step + 1] * scale) + model.jump_embed(
                 grid[step + 1 : step + 2] * scale
             )
             per_layer = []
@@ -295,11 +341,11 @@ class FlashMapDraftModel(nn.Module):
             self.modulations.append(
                 torch.cat(per_layer).view(len(self.layers), 9, -1).contiguous()
             )
-            f_scale, f_shift, _ = self.final_adaln(cond)
+            f_scale, f_shift, _ = model.final_adaln(cond)
             self.final_modulations.append(
                 torch.cat([1 + f_scale, f_shift]).contiguous()
             )
-        gate = self.noise_gate.float()
+        gate = model.noise_gate.float()
         if self.config.noise_gate == "jump":
             self.noise_gates = [
                 float(gate * (grid[s + 1] - grid[s])) for s in range(self.num_steps)
@@ -311,31 +357,14 @@ class FlashMapDraftModel(nn.Module):
         # reference forms softmax(0) @ E) through state_norm.
         vocab = embed_tokens.shape[0]
         uniform = torch.full((1, vocab), 1.0 / vocab, device=device, dtype=dtype)
-        self.uniform_state = self.state_norm(uniform @ embed_tokens)  # (1, hidden)
-        self.first_hidden = self.x_embed(self.uniform_state)[0]  # (dim,)
-
-        # One-jump noise: x0 @ E ~ N(0, E^T E) = z @ A, A = sqrt(Lambda) Q^T.
-        gram = torch.zeros(
-            embed_tokens.shape[1],
-            embed_tokens.shape[1],
-            device=device,
-            dtype=torch.float32,
+        self.first_hidden = model.x_embed(model.state_norm(uniform @ embed_tokens))[0]
+        self.noise_embed, self.noise_eigvals = fold_noise(
+            embed_tokens, model.noise_norm.weight, model.x_embed.weight
         )
-        for rows in embed_tokens.split(16384):
-            gram += rows.float().T @ rows.float()
-        eigvals, eigvecs = torch.linalg.eigh(gram.double())
-        eigvals = eigvals.clamp_min(0)
-        factor = eigvals.sqrt()[:, None] * eigvecs.T  # (hidden, hidden), A
-        # noise_norm(z A) = (z A) * w * r with r = rsqrt(sum(lambda z^2) / H + eps),
-        # and x_embed is linear: fold A, w and x_embed's weight together.
-        weight = self.noise_norm.weight.double()
-        self.noise_embed = (
-            self.x_embed.weight.double() @ (factor * weight[None, :]).T
-        ).to(dtype)  # (dim, hidden), as F.linear takes it
-        self.noise_eigvals = (eigvals / eigvals.numel()).float()  # lambda / H
-        del gram, eigvecs, factor
+        self.embed_weight = embed_tokens
 
-        # Context keys/values of every layer in one GEMM.
+        # Context keys/values of every layer in one GEMM; self-attention
+        # queries, keys and values in one GEMM per layer.
         self.context_kv_weight = torch.cat(
             [
                 torch.cat(
@@ -357,8 +386,7 @@ class FlashMapDraftModel(nn.Module):
             )
             for layer in self.layers
         ]
-        # Drop the now-duplicated projections.
-        for layer in self.layers:
+        for layer in self.layers:  # drop the now-duplicated projections
             for proj in (
                 layer.cross_attn.k_proj,
                 layer.cross_attn.v_proj,
@@ -369,43 +397,42 @@ class FlashMapDraftModel(nn.Module):
                 proj.weight = nn.Parameter(
                     proj.weight.new_empty(0), requires_grad=False
                 )
+        rope = getattr(self.config, "rope_parameters", None) or {}
         self.cos_sin = rope_table(
             self.max_model_len + self.block_size + 1,
             self.head_dim,
-            float(self.config.rope_parameters["rope_theta"])
-            if getattr(self.config, "rope_parameters", None)
-            else float(getattr(self.config, "rope_theta", 10000.0)),
+            float(rope.get("rope_theta", getattr(self.config, "rope_theta", 1e4))),
             device,
         )
 
         # The DiT head folded into the LM head (no nonlinearity between them).
         self.hot_ids = None
         if self.d2t is not None:
-            self.hot_ids = (
-                torch.arange(self.d2t.shape[0], device=device) + self.d2t.data
-            )
-        self.head_weight, self.head_bias = self._fold_head(lm_head, self.hot_ids)
+            self.hot_ids = torch.arange(self.d2t.shape[0], device=device) + self.d2t
+        head = model.head
+        self.head_weight, self.head_bias = fold_head(
+            lm_head, head.weight, head.bias, self.hot_ids
+        )
         self.jump_head = None
         if self.num_steps > 1:
             # Between jumps the state mixes in a full-vocabulary distribution.
             self.jump_head = (
                 (self.head_weight, self.head_bias)
                 if self.hot_ids is None
-                else self._fold_head(lm_head, None)
+                else fold_head(lm_head, head.weight, head.bias)
             )
-        self._cache_args = None
-        if os.environ.get("FLASHMAP_COMPILE", "1") == "1":
-            # FLASHMAP_COMPILE_MODE=max-autotune-no-cudagraphs lets inductor pick
-            # Triton GEMMs with fused epilogues (slower startup).
-            self._compiled = torch.compile(
-                self._dit,
-                dynamic=True,
-                fullgraph=True,
-                mode=os.environ.get("FLASHMAP_COMPILE_MODE") or None,
+        self._prologue_fn = self._prologue
+        self._one_jump_fn = self._one_jump
+        self._dit_fn = self._dit
+        if self.compile:
+            if self.experimental:
+                self._prologue_fn = torch.compile(
+                    self._prologue, dynamic=True, fullgraph=True
+                )
+            self._one_jump_fn = torch.compile(
+                self._one_jump, dynamic=True, fullgraph=True
             )
-            self._compiled_noise = torch.compile(
-                self._noise_input, dynamic=True, fullgraph=True
-            )
+            self._dit_fn = torch.compile(self._dit, dynamic=True, fullgraph=True)
         torch.cuda.empty_cache()
         logger.info(
             "FlashMap draft: %d jump(s) on grid %s, draft vocabulary %d",
@@ -414,27 +441,31 @@ class FlashMapDraftModel(nn.Module):
             self.head_weight.shape[0],
         )
 
-    def _fold_head(self, lm_head: torch.Tensor, rows: torch.Tensor | None, chunk=8192):
-        count = lm_head.shape[0] if rows is None else rows.numel()
-        weight = torch.empty(
-            count, self.head.weight.shape[1], dtype=lm_head.dtype, device=lm_head.device
-        )
-        bias = torch.empty(count, dtype=lm_head.dtype, device=lm_head.device)
-        head_weight, head_bias = self.head.weight.float(), self.head.bias.float()
-        for start in range(0, count, chunk):
-            part = (
-                lm_head[start : start + chunk]
-                if rows is None
-                else lm_head[rows[start : start + chunk]]
-            ).float()
-            weight[start : start + chunk] = (part @ head_weight).to(lm_head.dtype)
-            bias[start : start + chunk] = (part @ head_bias).to(lm_head.dtype)
-        return weight, bias
+    def _check_attention(self) -> None:
+        for layer in self.layers:
+            attn = layer.cross_attn.attn
+            version = getattr(attn.impl, "vllm_flash_attn_version", None)
+            if version is None:
+                raise ValueError(
+                    "FlashMap drafting needs the FlashAttention backend, got "
+                    f"{type(attn.impl).__name__}"
+                )
+            cache_dtype = getattr(attn, "kv_cache_torch_dtype", torch.bfloat16)
+            if cache_dtype != torch.bfloat16:
+                raise ValueError(
+                    "FlashMap drafting needs a bf16 draft KV cache, got "
+                    f"kv_cache_dtype={attn.kv_cache_dtype!r}"
+                )
+        self.fa_version = version
+
+    def set_noise_keys(self, seeds: torch.Tensor, rows: torch.Tensor) -> None:
+        """Key each query row's noise by ``seeds[rows[i]]`` and its position."""
+        self._noise_keys = (seeds, rows)
 
     # ------------------------------------------------------------------ context
 
     def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.fc(hidden_states)
+        return self.model.fc(hidden_states)
 
     def cache_layout(self):
         """Data pointers and strides of every layer's KV cache, or None before
@@ -444,10 +475,13 @@ class FlashMapDraftModel(nn.Module):
             return None
         ptrs = [c.data_ptr() for c in caches]
         if self._cache_args is None or self._cache_args[0] != ptrs:
+            if caches[0].dtype != torch.bfloat16:
+                raise ValueError(
+                    f"FlashMap needs a bf16 draft KV cache, got {caches[0].dtype}"
+                )
             key, value = caches[0].transpose(1, 2).split(self.head_dim, dim=-1)
-            assert key.stride(-1) == 1 and all(
-                c.stride() == caches[0].stride() for c in caches
-            )
+            assert key.stride(-1) == 1
+            assert all(c.stride() == caches[0].stride() for c in caches)
             strides = (
                 key.stride(0),
                 key.stride(2),
@@ -458,23 +492,13 @@ class FlashMapDraftModel(nn.Module):
             self._cache_args = (ptrs, ptr_tensor, strides, key.shape[1])
         return self._cache_args
 
-    def _store_context(
-        self,
-        context: torch.Tensor,
-        positions: torch.Tensor,
-        slots: torch.Tensor | None,
-    ) -> None:
-        """Every layer's keys/values of normed ``context (N, dim)`` at
-        ``positions``, written to the KV caches at ``slots``."""
-        kv = F.linear(context, self.context_kv_weight).view(
-            -1, len(self.layers), 2, self.num_heads, self.head_dim
-        )
-        layout = self.cache_layout() if slots is not None else None
+    def _write(self, kv: torch.Tensor, positions, slots) -> None:
+        layout = self.cache_layout()
         if layout is None:
             return
         _, ptrs, strides, block_size = layout
         write_context_kv(
-            kv,
+            kv.view(-1, len(self.layers), 2, self.num_heads, self.head_dim),
             positions,
             slots,
             self.context_k_norm,
@@ -489,14 +513,12 @@ class FlashMapDraftModel(nn.Module):
         self,
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
-        context_slot_mapping: torch.Tensor | list | None = None,
+        context_slot_mapping: torch.Tensor | None = None,
     ) -> None:
-        if isinstance(context_slot_mapping, (list, tuple)):
-            assert all(s is context_slot_mapping[0] for s in context_slot_mapping)
-            context_slot_mapping = context_slot_mapping[0]
-        self._store_context(
-            self.hidden_norm(context_states), context_positions, context_slot_mapping
-        )
+        context = self.model.hidden_norm(context_states)
+        kv = F.linear(context, self.context_kv_weight)
+        if context_slot_mapping is not None:
+            self._write(kv, context_positions, context_slot_mapping)
 
     def defer_context_kv(
         self,
@@ -505,12 +527,44 @@ class FlashMapDraftModel(nn.Module):
         context_slot_mapping: torch.Tensor,
     ) -> None:
         """``precompute_and_store_context_kv``, done by the next ``forward``
-        together with its anchors."""
+        together with its anchors (one GEMM over the context K/V weight)."""
         self._pending_context = (
             context_states,
             context_positions,
             context_slot_mapping,
         )
+
+    def _prologue(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        seq_lens: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        context: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    ):
+        """Keys/values, positions and slots to write (the pending context, then
+        each request's anchor) and each request's context length ``p + 1``."""
+        model = self.model
+        blocks = input_ids.shape[0] // self.block_size
+        anchors = input_ids.view(blocks, self.block_size)[:, 0]
+        anchor_positions = positions.view(blocks, self.block_size)[:, 0]
+        slots = slot_mapping.view(blocks, self.block_size)[:, 0]
+        rows = model.anchor_norm(
+            model.anchor_proj(F.embedding(anchors, self.embed_weight))
+        )
+        write_positions = anchor_positions
+        if context is not None:
+            states, context_positions, context_slots = context
+            rows = torch.cat([model.hidden_norm(states), rows])
+            write_positions = torch.cat([context_positions, anchor_positions])
+            slots = torch.cat([context_slots, slots])
+        kv = F.linear(rows, self.context_kv_weight)
+        # The context is positions 0..p. (The DFlash metadata's seq_lens count
+        # the block's other rows too, clamped to the model length.)
+        seqused_k = torch.where(
+            seq_lens > 0, anchor_positions.to(seq_lens.dtype) + 1, 0
+        )
+        return kv, write_positions, slots, seqused_k
 
     # ------------------------------------------------------------------ drafting
 
@@ -521,51 +575,52 @@ class FlashMapDraftModel(nn.Module):
         modulations: torch.Tensor,
         final_modulations: torch.Tensor,
         kv_caches: list[torch.Tensor],
-        cu_seqlens_q: torch.Tensor | None,
-        seqused_k: torch.Tensor | None,
-        block_table: torch.Tensor | None,
+        attention: tuple | None,
     ) -> torch.Tensor:
-        """The DiT on ``hidden (tokens, dim)`` (slots at ``positions``) with one
-        jump's modulations; returns the final AdaLN output."""
+        """The DiT on ``hidden (tokens, dim)`` for query rows at ``positions``
+        (slots at ``positions + 1``) with one jump's modulations; returns the
+        final AdaLN output."""
         tokens = hidden.shape[0]
         blocks = tokens // self.block_size
         heads, head_dim, dim = self.num_heads, self.head_dim, self.dim
+        eps = self.config.adaln_eps
+        slot_positions = positions + 1
         for layer_id, layer in enumerate(self.layers):
             mods = modulations[layer_id]
             self_attn, cross_attn = layer.self_attn, layer.cross_attn
-            normed = F.layer_norm(hidden, (dim,), eps=self.config.adaln_eps)
-            normed = normed * mods[0] + mods[1]
+            normed = F.layer_norm(hidden, (dim,), eps=eps) * mods[0] + mods[1]
             qkv = F.linear(normed, self.self_qkv_weights[layer_id])
             attn = block_self_attention(
                 qkv.view(blocks, self.block_size, 3, heads, head_dim),
                 self_attn.q_norm.weight,
                 self_attn.k_norm.weight,
                 self.cos_sin,
-                positions,
+                slot_positions,
                 self_attn.q_norm.eps,
             )
             hidden = hidden + mods[2] * F.linear(attn, self_attn.o_proj.weight)
 
-            normed = F.layer_norm(hidden, (dim,), eps=self.config.adaln_eps)
-            normed = normed * mods[3] + mods[4]
+            normed = F.layer_norm(hidden, (dim,), eps=eps) * mods[3] + mods[4]
             query = rms_norm_rope(
                 F.linear(normed, cross_attn.q_proj.weight).view(
                     tokens, heads, head_dim
                 ),
                 cross_attn.q_norm.weight,
                 self.cos_sin,
-                positions,
+                slot_positions,
                 cross_attn.q_norm.eps,
             )
-            if block_table is None:  # profiling run: no KV cache yet
+            if attention is None:  # profiling run: no KV cache yet
                 context = torch.zeros_like(query)
             else:
+                cu_seqlens_q, seqused_k, block_table, schedule = attention
                 context = paged_cross_attention(
                     query,
                     kv_caches[layer_id],
                     cu_seqlens_q,
                     seqused_k,
                     block_table,
+                    schedule,
                     self.block_size,
                     self.max_model_len,
                     self.softmax_scale,
@@ -575,48 +630,88 @@ class FlashMapDraftModel(nn.Module):
                 context.view(tokens, dim), cross_attn.o_proj.weight
             )
 
-            normed = F.layer_norm(hidden, (dim,), eps=self.config.adaln_eps)
-            normed = normed * mods[6] + mods[7]
+            normed = F.layer_norm(hidden, (dim,), eps=eps) * mods[6] + mods[7]
             mlp = layer.mlp
             hidden = hidden + mods[8] * F.linear(
                 F.gelu(F.linear(normed, mlp.fc1.weight, mlp.fc1.bias)),
                 mlp.fc2.weight,
                 mlp.fc2.bias,
             )
-        normed = F.layer_norm(hidden, (dim,), eps=self.config.adaln_eps)
+        normed = F.layer_norm(hidden, (dim,), eps=eps)
         return normed * final_modulations[0] + final_modulations[1]
 
-    def _first_jump_input(self, tokens: int, device) -> torch.Tensor:
-        """``x_embed(embed_state(x0, 0, t_1))`` for fresh noise, drawn in the
-        embedding's eigenbasis (see the module docstring)."""
-        z = torch.randn(
-            tokens, self.noise_embed.shape[1], device=device, dtype=torch.float32
-        )
-        return (self._compiled_noise or self._noise_input)(z)
-
-    def _noise_input(self, z: torch.Tensor) -> torch.Tensor:
-        if self.noise_scale != 1.0:
-            z = z * self.noise_scale
-        rms = torch.rsqrt((z * z) @ self.noise_eigvals + self.noise_norm.eps)
+    def _one_jump(
+        self,
+        z: torch.Tensor,
+        positions: torch.Tensor,
+        kv_caches: list[torch.Tensor],
+        attention: tuple | None,
+    ) -> torch.Tensor:
+        """One jump from noise ``z (tokens, hidden)``: its embedded state (the
+        uniform posterior's constant plus the folded noise read-out), then the
+        DiT."""
+        rms = torch.rsqrt((z * z) @ self.noise_eigvals + self.model.noise_norm.eps)
         noise = F.linear(z.to(self.dtype), self.noise_embed)
-        return (
+        hidden = (
             self.first_hidden
             + (self.noise_gates[0] * rms)[:, None].to(self.dtype) * noise
+        )
+        return self._dit(
+            hidden,
+            positions,
+            self.modulations[0],
+            self.final_modulations[0],
+            kv_caches,
+            attention,
         )
 
     def _embed_state(self, state: torch.Tensor, step: int) -> torch.Tensor:
         """``x_embed(embed_state(state, s, t))`` of a vocabulary-sized float32
         ``state`` at jump ``step``, as the reference computes it."""
+        model, weight = self.model, self.embed_weight
         start = self.time_grid[step]
-        weight = self.embed_tokens
         evidence = start / max(1.0 - start, 1e-3) ** 2
         posterior = (state * evidence).softmax(dim=-1)
         both = torch.cat([posterior, state]).to(weight.dtype) @ weight
         posterior_emb, state_emb = both.split(state.shape[0])
-        embedded = self.state_norm(posterior_emb) + (
-            self.noise_gates[step] * self.noise_norm(state_emb)
+        embedded = model.state_norm(posterior_emb) + (
+            self.noise_gates[step] * model.noise_norm(state_emb)
         ).to(weight.dtype)
-        return self.x_embed(embedded)
+        return model.x_embed(embedded)
+
+    def _noise(self, positions: torch.Tensor, n_cols: int) -> torch.Tensor:
+        tokens = positions.shape[0]
+        if self._noise_keys is None or not self.experimental:
+            noise = torch.randn(
+                tokens, n_cols, device=positions.device, dtype=torch.float32
+            )
+            return noise if self.noise_scale == 1.0 else noise * self.noise_scale
+        seeds, rows = self._noise_keys
+        return seeded_normal(seeds, rows[:tokens], positions, n_cols, self.noise_scale)
+
+    def _cross_attention_schedule(self, metadata, seqused_k):
+        """FlashAttention 3's tile schedule for the step's cross-attention,
+        shared by every layer (it depends only on shapes and lengths)."""
+        if (
+            not self.experimental
+            or self.fa_version != 3  # noqa: PLR2004
+            or get_scheduler_metadata is None
+        ):
+            return None
+        caches = self.layers[0].cross_attn.attn.kv_cache
+        return get_scheduler_metadata(
+            batch_size=seqused_k.shape[0],
+            max_seqlen_q=self.block_size,
+            max_seqlen_k=self.max_model_len,
+            num_heads_q=self.num_heads,
+            num_heads_kv=self.num_heads,
+            headdim=self.head_dim,
+            cache_seqlens=seqused_k,
+            qkv_dtype=self.dtype,
+            cu_seqlens_q=metadata.query_start_loc,
+            page_size=caches.shape[2],
+            causal=False,
+        )
 
     def forward(
         self,
@@ -625,60 +720,41 @@ class FlashMapDraftModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,  # noqa: ARG002
     ) -> torch.Tensor:
         tokens = input_ids.shape[0]
-        blocks = tokens // self.block_size
-        metadata = get_forward_context().attn_metadata
         kv_caches = [layer.cross_attn.attn.kv_cache for layer in self.layers]
-        cu_seqlens_q = seqused_k = block_table = None
+        metadata = get_forward_context().attn_metadata
+        pending, self._pending_context = self._pending_context, None
+        attention = None
         if metadata is not None:
             metadata = metadata[self.layers[0].cross_attn.attn.layer_name]
-            cu_seqlens_q = metadata.query_start_loc
-            block_table = metadata.block_table
-            # The context is positions 0..p (the anchor's), and the DFlash
-            # attention metadata counts the block's other rows too.
-            seqused_k = (metadata.seq_lens - (self.block_size - 1)).clamp_(min=0)
-            anchor_rows = input_ids.view(blocks, self.block_size)[:, 0]
-            anchor_context = self.anchor_norm(
-                self.anchor_proj(F.embedding(anchor_rows, self.embed_tokens))
+            kv, write_positions, write_slots, seqused_k = self._prologue_fn(
+                input_ids,
+                positions,
+                metadata.seq_lens,
+                metadata.slot_mapping[:tokens],
+                pending,
             )
-            # The kernels index positions and slots densely: gather row 0s.
-            anchor_positions = positions.view(blocks, self.block_size)[:, 0]
-            anchor_slots = metadata.slot_mapping[:tokens].view(blocks, self.block_size)[
-                :, 0
-            ]
-            if self._pending_context is not None:
-                states, context_positions, context_slots = self._pending_context
-                anchor_context = torch.cat([self.hidden_norm(states), anchor_context])
-                anchor_positions = torch.cat([context_positions, anchor_positions])
-                anchor_slots = torch.cat([context_slots, anchor_slots])
-                self._pending_context = None
-            self._store_context(
-                anchor_context, anchor_positions.contiguous(), anchor_slots.contiguous()
+            self._write(kv, write_positions, write_slots)
+            attention = (
+                metadata.query_start_loc,
+                seqused_k,
+                metadata.block_table,
+                self._cross_attention_schedule(metadata, seqused_k),
             )
-        slot_positions = positions + 1
-        dit = self._compiled or self._dit
-        dit_args = (kv_caches, cu_seqlens_q, seqused_k, block_table)
 
         if self.num_steps == 1:
-            hidden = self._first_jump_input(tokens, input_ids.device)
-            return dit(
-                hidden,
-                slot_positions,
-                self.modulations[0],
-                self.final_modulations[0],
-                *dit_args,
-            )
+            z = self._noise(positions, self.noise_embed.shape[1])
+            return self._one_jump_fn(z, positions, kv_caches, attention)
 
         # Several jumps (Algorithm 8): x <- X_{t_n, t_n+1}(x) between jumps.
-        state = self.noise_scale * torch.randn(
-            tokens, self.vocab_size, device=input_ids.device, dtype=torch.float32
-        )
+        state = self._noise(positions, self.vocab_size)
         for step in range(self.num_steps):
-            hidden = dit(
+            hidden = self._dit_fn(
                 self._embed_state(state, step),
-                slot_positions,
+                positions,
                 self.modulations[step],
                 self.final_modulations[step],
-                *dit_args,
+                kv_caches,
+                attention,
             )
             if step + 1 < self.num_steps:
                 weight, bias = self.jump_head

@@ -112,6 +112,7 @@ class FlashMapSpeculator(DFlashSpeculator):
 
     def set_attn(self, *args, **kwargs) -> None:
         super().set_attn(*args, **kwargs)
+        target_attn_groups = kwargs.get("target_attn_groups", args[-1] if args else [])
         # The cross-attention schedules itself (model.py); vLLM's ahead-of-time
         # FlashAttention schedule for the draft group would be unused work, and
         # it mistakes an fp8 draft cache under a bf16 target for an unsupported
@@ -120,6 +121,15 @@ class FlashMapSpeculator(DFlashSpeculator):
             for group in groups:
                 builder = group.get_metadata_builder()
                 if getattr(builder, "aot_schedule", False):
+                    builder.aot_schedule = False  # type: ignore[attr-defined]
+        # The target runner builds metadata for the draft group too (cudagraph
+        # capture), through its own builders.
+        for gid in self.draft_kv_cache_group_ids:
+            for group in target_attn_groups[gid]:
+                builder = group.get_metadata_builder()
+                if getattr(builder, "aot_schedule", False) and getattr(
+                    builder, "kv_cache_dtype", None
+                ) not in (torch.bfloat16, torch.float16):
                     builder.aot_schedule = False  # type: ignore[attr-defined]
 
     def _precompute_context_kv(

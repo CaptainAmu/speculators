@@ -154,7 +154,12 @@ def maybe_convert_external_checkpoint(
     """
     if config_dict is None:
         config_dict, _ = PretrainedConfig.get_config_dict(model, cache_dir=cache_dir)
-    if "speculators_model_type" in config_dict:
+    # A FlashMap release folder carries a speculators header for vLLM's plugin,
+    # but its weights still need `speculators convert --algorithm flashmap`.
+    if (
+        "speculators_model_type" in config_dict
+        and config_dict.get("model_type") != "flashmap"
+    ):
         return str(model)
 
     architectures = config_dict.get("architectures") or []

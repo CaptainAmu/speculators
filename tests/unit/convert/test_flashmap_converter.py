@@ -122,6 +122,32 @@ def test_build_config_from_deepspec():
     assert reloaded.time_grid(2) == DEFAULT_TIME_GRIDS[1]
 
 
+def test_build_config_from_release_with_vllm_header():
+    """A release folder's speculators header (for flashmap[vllm]) does not make
+    it a speculators checkpoint: its config is still built from its fields."""
+    weights = deepspec_to_canonical(_deepspec_state())
+    source = {
+        "model_type": "flashmap",
+        "block_size": 4,
+        "target_layer_ids": [0, 1],
+        "rope_theta": 5000.0,
+        "speculators_model_type": "flashmap",
+        "speculators_config": {"algorithm": "flashmap"},
+        "transformer_layer_config": {},
+        "draft_vocab_size": 16,
+    }
+    verifier = {"hidden_size": _HIDDEN, "vocab_size": 32, "architectures": ["X"]}
+    with patch(
+        "speculators.convert.flashmap.converter.PretrainedConfig.get_config_dict",
+        return_value=(verifier, {}),
+    ):
+        config = FlashMapConverter()._build_config(source, weights, "verifier", 1)
+    assert config.aux_hidden_state_layer_ids == [1, 2]
+    assert config.transformer_layer_config.hidden_size == _DIM
+    assert config.transformer_layer_config.rope_parameters["rope_theta"] == 5000.0
+    assert config.draft_vocab_size == 32  # restricted only by convert()'s ranking
+
+
 def test_draft_vocab_mapping(tmp_path):
     from safetensors.torch import save_file  # noqa: PLC0415
 

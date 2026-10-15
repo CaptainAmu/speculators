@@ -177,8 +177,9 @@ class FlashMapConverter:
                 f"checkpoint was trained on hidden size {target_hidden}, but "
                 f"{base_model} has {verifier_config['hidden_size']}"
             )
-        if source.get("speculators_model_type") == "flashmap":
-            # Already this schema (e.g. saved by speculators train).
+        if source.get("speculators_model_type") == "flashmap" and not released:
+            # Already this schema (e.g. saved by speculators train); a release
+            # folder carries the speculators header only for vLLM's plugin.
             if source.get("flow_map") is False:
                 raise ValueError(
                     "this is a stage-1 FlashMap flow (flow_map: false); convert "

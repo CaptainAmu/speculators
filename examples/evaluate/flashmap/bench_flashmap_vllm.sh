@@ -97,8 +97,9 @@ run_server() {
         done
         # A FlashMap block is all drafts; a DFlash block's first slot is the anchor.
         [[ "$method" == "dflash" ]] && num_spec=$(( num_spec - 1 ))
-        # FlashMap runs on vLLM's DFlash runtime.
-        local spec_json="{\"model\": \"$draft\", \"method\": \"dflash\""
+        # FlashMap runs on vLLM's DFlash runtime; its plugin fills in the method.
+        local spec_json="{\"model\": \"$draft\""
+        [[ "$method" == "dflash" ]] && spec_json+=", \"method\": \"dflash\""
         spec_json+=", \"num_speculative_tokens\": $num_spec"
         [[ -n "$kv_dtype" ]] && spec_json+=", \"kv_cache_dtype\": \"$kv_dtype\""
         if [[ "$TEMPERATURE" != "0" ]]; then

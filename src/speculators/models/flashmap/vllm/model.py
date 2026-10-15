@@ -304,6 +304,16 @@ class FlashMapDraftModel(nn.Module):
         for checkpoint_name, tensor in weights:
             if checkpoint_name in ("embed_tokens.weight", "lm_head.weight", "t2d"):
                 continue  # the target's own, shared at load
+            if checkpoint_name in ("ids", "counts"):
+                # A release folder's draft_vocab.safetensors: the target's
+                # tokens, most frequent first; the draft head keeps the first
+                # draft_vocab_size of them.
+                if checkpoint_name == "ids" and self.d2t is not None:
+                    size = self.d2t.shape[0]
+                    hot = tensor[:size].to(torch.int64).sort().values
+                    self.d2t.data.copy_(hot - torch.arange(size, device=hot.device))
+                    loaded.add("d2t")
+                continue
             name = (
                 checkpoint_name
                 if checkpoint_name == "d2t"

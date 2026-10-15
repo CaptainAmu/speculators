@@ -62,10 +62,11 @@ def convert(
                 '"eagle_aux_hidden_state_layer_ids": [1,23,44]}. '
                 'Options for MTP: {"num_speculative_steps": 3}. '
                 'Options for DFlash: {"aux_hidden_state_layer_ids": [2,10,18,26,34]}. '
-                'Options for FlashMap: {"draft_vocab_size": 65536, '
-                '"draft_vocab_file": "ranking.safetensors", "num_steps": 1}; a '
-                "release folder's draft_vocab.safetensors gives a 65536-token draft "
-                'vocabulary by default, {"draft_vocab_size": 0} keeps the full one.'
+                'Options for FlashMap: {"draft_vocab_file": "token_freq.pt", '
+                '"draft_vocab_size": 65536, "num_steps": 1}; with a draft_vocab_file '
+                "(the token_freq.pt of prepare-data --no-skip-token-freq, or a "
+                "ranking), the release folder "
+                "ships it and drafts over its 65536 most frequent tokens by default."
             ),
         ),
     ] = None,
@@ -109,14 +110,16 @@ def convert(
 
     \b
     algorithm=="flashmap":
-        FlashMap (a released, DeepSpec flow-map or speculators-trained checkpoint;
-        the draft_vocab_file is a ranking or prepare-data's token_freq.pt)
+        FlashMap, the other way round: a flow map trained with speculators to
+        the FlashMap release format, which the flashmap package serves
+        (https://github.com/al-jshen/flashmap)
         ::
-        speculators convert ./FlashMap-Qwen3-8B \\
+        speculators convert ./output/flashmap/map/11 \\
             --algorithm flashmap \\
             --verifier "Qwen/Qwen3-8B" \\
+            --output-path ./FlashMap-Qwen3-8B \\
             --algorithm-kwargs \\
-            '{"draft_vocab_size": 65536, "draft_vocab_file": "ranking.safetensors"}'
+            '{"draft_vocab_file": "./output/qwen3_8b_regen/token_freq.pt"}'
     """
     if not algorithm_kwargs:
         algorithm_kwargs = {}

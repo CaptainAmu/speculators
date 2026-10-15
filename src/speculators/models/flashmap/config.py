@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import Field, model_validator
 
@@ -104,6 +104,20 @@ class FlashMapSpeculatorConfig(DFlashSpeculatorConfig):
         default_factory=lambda: [list(grid) for grid in DEFAULT_TIME_GRIDS],
         description="time_grids[n - 1] is the jump grid used for n jumps.",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_release_folders(cls, data: Any) -> Any:
+        """A FlashMap release folder (``model_type: "flashmap"``) also carries a
+        speculators header, for vLLM; it is not a speculators checkpoint."""
+        if isinstance(data, dict) and data.get("model_type") == "flashmap":
+            raise ValueError(
+                "This is a FlashMap release folder (model_type 'flashmap'), the "
+                "format the flashmap package serves, not a speculators checkpoint. "
+                "Train from speculators checkpoints (e.g. a stage-1 flow for "
+                "--flashmap-teacher)."
+            )
+        return data
 
     @model_validator(mode="after")
     def check_time_grids(self) -> "FlashMapSpeculatorConfig":

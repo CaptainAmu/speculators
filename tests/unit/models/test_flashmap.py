@@ -1,9 +1,11 @@
+import json
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
 from safetensors import safe_open
+from safetensors.torch import load_file
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     set_model_state_dict,
@@ -11,14 +13,16 @@ from torch.distributed.checkpoint.state_dict import (
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Config
 
 from speculators.config import SpeculatorsConfig, VerifierConfig
-from speculators.convert.flashmap.converter import FlashMapConverter
+from speculators.convert.flashmap.converter import (
+    FlashMapConverter,
+    release_weight_names,
+)
 from speculators.losses import resolve_loss_config
 from speculators.model import SpeculatorModel
 from speculators.models.flashmap import FlashMapDraftModel, FlashMapSpeculatorConfig
 from speculators.models.flashmap.config import DEFAULT_TIME_GRIDS
 from speculators.models.flashmap.metrics import slot_loss_weights
 from speculators.models.flashmap.schedule import DecodingErrorSchedule
-from speculators.models.flashmap.vllm import FLASHMAP_ARCHITECTURE, update_flashmap
 from speculators.proposals.greedy import GreedyTokenProposalConfig
 from speculators.train.config.schema import TrainConfig
 from speculators.train.distributed import apply_fully_sharded
@@ -88,42 +92,6 @@ def _batch(seq_len: int = 40, num_docs: int = 2):
         "position_ids": position_ids,
         "verifier_last_hidden_states": torch.randn(1, seq_len, HIDDEN),
     }
-
-
-def _vllm_plugin_weight_names(num_layers: int) -> set[str]:
-    """The weights the vLLM plugin's FlashMapDraftModel loads (every parameter
-    of speculators/models/flashmap/vllm/model.py but the target's own and the
-    attention layers' cache scales), for a full-vocabulary draft."""
-    names = {
-        "fc.weight",
-        "hidden_norm.weight",
-        "anchor_proj.weight",
-        "anchor_proj.bias",
-        "anchor_norm.weight",
-        "state_norm.weight",
-        "noise_norm.weight",
-        "noise_gate",
-        "x_embed.weight",
-        "x_embed.bias",
-        "final_adaln.linear.weight",
-        "final_adaln.linear.bias",
-        "head.weight",
-        "head.bias",
-    }
-    for embed in ("time_embed", "jump_embed"):
-        names |= {f"{embed}.linear_{i}.{p}" for i in (1, 2) for p in ("weight", "bias")}
-    for n in range(num_layers):
-        for adaln in ("self_attn_adaln", "cross_attn_adaln", "mlp_adaln"):
-            names |= {f"layers.{n}.{adaln}.linear.{p}" for p in ("weight", "bias")}
-        for attn in ("self_attn", "cross_attn"):
-            names |= {
-                f"layers.{n}.{attn}.{p}.weight"
-                for p in ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm")
-            }
-        names |= {
-            f"layers.{n}.mlp.fc{i}.{p}" for i in (1, 2) for p in ("weight", "bias")
-        }
-    return names
 
 
 def _toy_verifier_config() -> Qwen3Config:
@@ -366,8 +334,8 @@ def test_checkpoint_layout(tmp_path):
     flow_map.save_pretrained(tmp_path)
     with safe_open(tmp_path / "model.safetensors", framework="pt") as f:
         keys = set(f.keys())
-    # Exactly what the vLLM plugin loads: no verifier weights, nothing missing.
-    assert keys == _vllm_plugin_weight_names(num_layers=2)
+    # Exactly a release folder's weights: no verifier weights, nothing missing.
+    assert keys == release_weight_names(num_layers=2)
 
     loaded = FlashMapDraftModel.from_pretrained(tmp_path)
     assert loaded.config.flow_map
@@ -469,27 +437,65 @@ def test_wsd_scheduler_holds_then_anneals():
     assert lrs[99] < 0.01
 
 
-def test_training_config_feeds_the_vllm_plugin(offline_verifier):
+def test_training_config_converts_to_a_release_folder(offline_verifier, tmp_path):
     flow = FlashMapDraftModel.from_training_args(
         _toy_verifier_config(), **_training_args()
     )
     assert not flow.config.flow_map
-    with pytest.raises(ValueError, match="stage-1 flow"):
-        update_flashmap(flow.config.to_dict(), {})
+    flow.save_pretrained(tmp_path / "flow")
+    _toy_verifier_config().save_pretrained(tmp_path / "verifier")
+    with pytest.raises(ValueError, match="stage-1 FlashMap flow"):
+        FlashMapConverter().convert(
+            tmp_path / "flow", tmp_path / "out0", str(tmp_path / "verifier")
+        )
 
     flow_map = FlashMapDraftModel.from_training_args(
         _toy_verifier_config(), **_training_args(flashmap_teacher=flow)
     )
-    config_dict = flow_map.config.to_dict()
-    pre_trained_config = dict(config_dict["transformer_layer_config"])
-    update_flashmap(config_dict, pre_trained_config)
-    assert pre_trained_config["architectures"] == [FLASHMAP_ARCHITECTURE]
-    assert pre_trained_config["eagle_aux_hidden_state_layer_ids"] == [0, 1]
-    assert pre_trained_config["dflash_config"]["target_layer_ids"] == [-1, 0]
-    assert pre_trained_config["target_hidden_size"] == HIDDEN
-    assert pre_trained_config["timestep_embed_dim"] == 16
-    assert pre_trained_config["time_grids"] == flow_map.config.time_grids
-    assert pre_trained_config["hidden_size"] == 32  # the DiT's
+    flow_map.save_pretrained(tmp_path / "map")
+    FlashMapConverter().convert(
+        tmp_path / "map", tmp_path / "release", str(tmp_path / "verifier")
+    )
+    release = json.loads((tmp_path / "release" / "config.json").read_text())
+    assert release["model_type"] == "flashmap"
+    assert release["architectures"] == ["FlashMapDraftModel"]
+    # Decoder-layer outputs: the speculators ids (decoder-layer inputs) minus one.
+    assert release["target_layer_ids"] == [-1, 0]
+    assert release["target_hidden_size"] == HIDDEN
+    assert release["vocab_size"] == VOCAB
+    assert release["hidden_size"] == 32  # the DiT's
+    assert release["num_hidden_layers"] == 2
+    assert release["num_attention_heads"] == 4
+    assert release["cond_dim"] == 16
+    assert release["block_size"] == BLOCK
+    assert release["jump_grids"] == {
+        str(n): grid for n, grid in enumerate(flow_map.config.time_grids, start=1)
+    }
+    # What vLLM reads, with the full vocabulary (no ranking given).
+    assert release["speculators_model_type"] == "flashmap"
+    assert release["speculators_config"]["verifier"]["name_or_path"] == str(
+        tmp_path / "verifier"
+    )
+    assert (
+        release["speculators_config"]["proposal_methods"][0]["speculative_tokens"]
+        == BLOCK
+    )
+    assert release["transformer_layer_config"] == {}
+    assert "draft_vocab_size" not in release
+    # What SGLang reads; the mask token (which FlashMap never reads) is any id past
+    # the tokenizer's, here the toy verifier's.
+    assert release["max_position_embeddings"] == 131072
+    dspark = release["dspark_config"]
+    assert (dspark["markov_rank"], dspark["markov_head_type"]) == (1, "vanilla")
+    assert 0 <= dspark["mask_token_id"] < VOCAB
+    assert not (tmp_path / "release" / "draft_vocab.safetensors").exists()
+    with pytest.raises(ValueError, match="already a FlashMap release folder"):
+        FlashMapConverter().convert(
+            tmp_path / "release", tmp_path / "out1", str(tmp_path / "verifier")
+        )
+    # A release folder is not a speculators checkpoint.
+    with pytest.raises(ValueError, match="release folder"):
+        FlashMapSpeculatorConfig.from_pretrained(tmp_path / "release")
 
 
 def test_flow_map_rejects_other_target_layers(offline_verifier):
@@ -505,23 +511,33 @@ def test_converter_keeps_a_trained_config(tmp_path):
     flow_map.config.adaln_eps = 1e-5  # not the default: must survive conversion
     flow_map.save_pretrained(tmp_path / "trained")
     _toy_verifier_config().save_pretrained(tmp_path / "verifier")
-    token_freq = {token: VOCAB - token for token in range(VOCAB)}
+    token_freq = {token: VOCAB - token for token in range(0, VOCAB, 2)}
     torch.save(token_freq, tmp_path / "token_freq.pt")
 
     FlashMapConverter().convert(
         tmp_path / "trained",
-        tmp_path / "served",
+        tmp_path / "release",
         base_model=str(tmp_path / "verifier"),
         draft_vocab_size=16,
         draft_vocab_file=str(tmp_path / "token_freq.pt"),
     )
-    served = FlashMapSpeculatorConfig.from_pretrained(tmp_path / "served")
-    assert served.adaln_eps == 1e-5
-    assert served.draft_vocab_size == 16
-    assert served.aux_hidden_state_layer_ids == [0, 1]
-    with safe_open(tmp_path / "served" / "model.safetensors", framework="pt") as f:
-        assert torch.equal(f.get_tensor("t2d").nonzero().squeeze(-1), torch.arange(16))
-        assert set(f.keys()) == _vllm_plugin_weight_names(num_layers=2) | {"d2t", "t2d"}
+    release = json.loads((tmp_path / "release" / "config.json").read_text())
+    assert release["layer_norm_eps"] == 1e-5
+    assert release["draft_vocab_size"] == 16
+    ranking = load_file(tmp_path / "release" / "draft_vocab.safetensors")
+    # Seen tokens by count, then the unseen ones by id.
+    expected = torch.cat([torch.arange(0, VOCAB, 2), torch.arange(1, VOCAB, 2)])
+    assert torch.equal(ranking["ids"], expected)
+    assert ranking["counts"][: VOCAB // 2].tolist() == [
+        VOCAB - t for t in range(0, VOCAB, 2)
+    ]
+    assert not ranking["counts"][VOCAB // 2 :].any()
+    with safe_open(tmp_path / "release" / "model.safetensors", framework="pt") as f:
+        assert set(f.keys()) == release_weight_names(num_layers=2)
+        assert f.get_tensor("head.weight").dtype == torch.bfloat16
+        torch.testing.assert_close(
+            f.get_tensor("head.weight"), flow_map.head.weight.to(torch.bfloat16)
+        )
 
 
 @pytest.mark.parametrize("stage", ["flow", "map"])

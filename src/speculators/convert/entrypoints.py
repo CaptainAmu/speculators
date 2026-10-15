@@ -78,12 +78,16 @@ def convert_model(
         )
 
     algorithm=="flashmap":
-        FlashMap: a released checkpoint or a DeepSpec flow-map checkpoint
+        FlashMap, the other way round: a flow map trained with speculators to the
+        FlashMap release format, which the flashmap package serves
+        (https://github.com/al-jshen/flashmap)
         ::
         convert_model(
-            model="./FlashMap-Qwen3-8B",
+            model="./output/flashmap/map/11",
             verifier="Qwen/Qwen3-8B",
             algorithm="flashmap",
+            output_path="./FlashMap-Qwen3-8B",
+            draft_vocab_file="./output/qwen3_8b_regen/token_freq.pt",
         )
 
     :param model: Path to the input model checkpoint or Hugging Face model ID.
@@ -97,8 +101,8 @@ def convert_model(
         "eagle_aux_hidden_state_layer_ids": [1,23,44]}.
         Options for MTP: {"num_speculative_steps": 3}.
         Options for DFlash: {"aux_hidden_state_layer_ids": [2,10,18,26,34]}.
-        Options for FlashMap: {"num_steps": 1, "draft_vocab_size": 65536,
-        "draft_vocab_file": "ranking.safetensors"}.
+        Options for FlashMap: {"draft_vocab_file": "token_freq.pt",
+        "draft_vocab_size": 65536, "num_steps": 1}.
     """
 
     if algorithm == "eagle3":
@@ -126,13 +130,8 @@ def convert_model(
             **kwargs,
         )
     elif algorithm == "flashmap":
-        FlashMapConverter().convert(
-            model,
-            output_path,
-            verifier,
-            validate=validate_device is not None,
-            **kwargs,
-        )
+        # Validation only re-reads the written folder, so it always runs.
+        FlashMapConverter().convert(model, output_path, verifier, **kwargs)
     else:
         raise ValueError(f"Unsupported algorithm: {algorithm}")
 
@@ -154,12 +153,7 @@ def maybe_convert_external_checkpoint(
     """
     if config_dict is None:
         config_dict, _ = PretrainedConfig.get_config_dict(model, cache_dir=cache_dir)
-    # A FlashMap release folder carries a speculators header for vLLM's plugin,
-    # but its weights still need `speculators convert --algorithm flashmap`.
-    if (
-        "speculators_model_type" in config_dict
-        and config_dict.get("model_type") != "flashmap"
-    ):
+    if "speculators_model_type" in config_dict:
         return str(model)
 
     architectures = config_dict.get("architectures") or []

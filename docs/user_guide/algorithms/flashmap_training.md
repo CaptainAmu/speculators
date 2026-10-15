@@ -17,7 +17,7 @@ The flow map `delta_{s,t}(x)` jumps the path from time `s` to time `t` in one ev
 FlashMap trains in two stages, both through the standard `speculators train` command with `--speculator-type flashmap`:
 
 1. **Flow** (default): the denoiser is trained with cross-entropy against the data tokens of anchor-sampled blocks, each noised to its own time from the decoding-error schedule. Use target-generated data ([response regeneration](../tutorials/response_regeneration.md)): the flow models the distribution the data was drawn from.
-2. **Flow map**: `--flashmap-teacher <stage-1 checkpoint>` builds the flow map from a trained flow (its architecture is taken from the teacher) and distils it. The teacher stays frozen in memory and is not saved. The resulting checkpoints are what is served.
+2. **Flow map**: `--flashmap-teacher <stage-1 checkpoint>` builds the flow map from a trained flow (its architecture is taken from the teacher) and distills it. The teacher stays frozen in memory and is not saved. The resulting checkpoints are the drafter, which is [converted for serving](#serving-the-result).
 
 Each block's slots are weighted by `exp(-k / gamma)` for slot `k` (`--dflash-decay-gamma`, default 7; 0 turns the decay off). Validation additionally reports the one-step draft's greedy agreement with the verifier per slot (`position_k_acc`) and its expected accepted length (`eal`). The validation loss is itself random (fresh times and noise each pass), so compare checkpoints by `eal` rather than with `--save-best`, which ranks them by that loss.
 
@@ -48,7 +48,7 @@ torchrun --standalone --nproc_per_node 8 -m speculators.train \
     --max-anchors 128 --epochs 12
 ```
 
-`--target-layer-ids` follows the speculators/vLLM convention used by `launch_vllm.py` and the vLLM plugin (`eagle_aux_hidden_state_layer_ids`): id `i` is the hidden state entering decoder layer `i`, i.e. `hidden_states[i]` of a Hugging Face forward. The released Qwen3-8B and Qwen3-4B drafters read `2 10 18 26 34`; their DeepSpec configs list the same layers as `target_layer_ids = [1, 9, 17, 25, 33]` (decoder-layer outputs, `hidden_states[i + 1]`), which `speculators convert --algorithm flashmap` shifts by one. Use the same ids for data generation and both training stages; stage 2 takes them from the teacher and rejects a different `--target-layer-ids`.
+`--target-layer-ids` follows the speculators/vLLM convention used by `launch_vllm.py` (vLLM's `eagle_aux_hidden_state_layer_ids`): id `i` is the hidden state entering decoder layer `i`, i.e. `hidden_states[i]` of a Hugging Face forward. The released Qwen3-8B and Qwen3-4B drafters read `2 10 18 26 34`; the release format lists the same layers as the decoder-layer outputs `target_layer_ids = [1, 9, 17, 25, 33]` (`hidden_states[i + 1]`), and the conversion below shifts them by one. Use the same ids for data generation and both training stages; stage 2 takes them from the teacher and rejects a different `--target-layer-ids`.
 
 The released recipe trains both stages with AdamW and `beta2 = 0.95` (the default 0.999 let the flow's loss spike on a 500k-sample run), decaying weights but not biases and norm gains, with a cosine schedule for the flow and warmup-stable-decay (`wsd`: hold the peak rate, anneal over the last 20% of the steps) for the map. The flow map holds several vocabulary-sized states per draft slot during a step (the teacher's target and two half-jumps), so it is trained with fewer anchors than the flow: `--max-anchors` defaults to 128 with `--flashmap-teacher` and 512 otherwise. A flow-map run starts from its teacher, so `--from-pretrained` is rejected with `--flashmap-teacher`; rerun with the same `--save-path` to resume it. See `examples/train/flashmap_qwen3_8b_two_stage_offline.sh` for the full pipeline.
 
@@ -63,20 +63,28 @@ An optimizer step takes one packed row of `--total-seq-len` tokens per GPU, with
 
 ### Serving the Result
 
-Checkpoints of the flow map are speculators FlashMap checkpoints (the same layout as a converted release), which the [vLLM plugin](flashmap.md) serves as they are:
+The flow map's checkpoints are speculators checkpoints. `speculators convert` writes one in the FlashMap release format, the format of the published drafters, which the [flashmap](https://github.com/al-jshen/flashmap) package serves in vLLM and SGLang and loads with `transformers`:
 
 ```bash
-vllm serve Qwen/Qwen3-8B --speculative-config \
-    '{"model": "./output/flashmap/map/11", "method": "dflash", "num_speculative_tokens": 16}'
+speculators convert ./output/flashmap/map/11 --algorithm flashmap --verifier Qwen/Qwen3-8B \
+    --output-path ./FlashMap-Qwen3-8B-mine \
+    --algorithm-kwargs '{"draft_vocab_file": "./output/qwen3_8b_regen/token_freq.pt"}'
 ```
 
-Stage-1 flows are not drafters and are refused. To serve with a restricted draft vocabulary, convert the checkpoint with the token frequencies `prepare-data` wrote: `speculators convert ./output/flashmap/map/11 --algorithm flashmap --verifier Qwen/Qwen3-8B --algorithm-kwargs '{"draft_vocab_size": 65536, "draft_vocab_file": "./output/qwen3_8b_regen/token_freq.pt"}' --output-path ./FlashMap-Qwen3-8B-v64k`. To publish in the standalone Hugging Face format (`model_type: "flashmap"`, loaded with `trust_remote_code`), convert the speculators checkpoint with the FlashMap release repository's converter.
+The folder holds `config.json`, `model.safetensors` (bf16, without the verifier's embedding and LM head) and, with a `draft_vocab_file` (the token frequencies `prepare-data --no-skip-token-freq` writes to its output, or a ranking), `draft_vocab.safetensors`, whose 65536 most frequent tokens the serving integrations draft over (`"draft_vocab_size"` picks another number; without a `draft_vocab_file` they draft over the full vocabulary). When the flashmap package is installed, the converter also copies its model code into the folder, so that `AutoModel.from_pretrained(..., trust_remote_code=True)` loads it without the package. Stage-1 flows are not drafters and are refused.
+
+Serve the folder with the flashmap package:
+
+```bash
+uv pip install "vllm==0.31.*" "flashmap[vllm] @ git+https://github.com/al-jshen/flashmap"
+vllm serve Qwen/Qwen3-8B --speculative-config '{"model": "./FlashMap-Qwen3-8B-mine", "num_speculative_tokens": 16}'
+```
 
 ## Key Parameters
 
 | Parameter               | Default | Description                                                                   |
 | ----------------------- | ------- | ----------------------------------------------------------------------------- |
-| `--flashmap-teacher`    | unset   | Stage 2: the stage-1 flow checkpoint to initialize and distil the map from    |
+| `--flashmap-teacher`    | unset   | Stage 2: the stage-1 flow checkpoint to initialize and distill the map from   |
 | `--num-layers`          | 6       | DiT blocks (stage 1; stage 2 copies the teacher)                              |
 | `--dit-hidden-size`     | 2048    | DiT width (stage 1)                                                           |
 | `--dit-num-heads`       | 16      | DiT attention heads (stage 1)                                                 |
@@ -90,14 +98,14 @@ Stage-1 flows are not drafters and are refused. To serve with a restricted draft
 | `--scheduler-type wsd`  |         | Warmup, hold, cosine anneal over the last `--scheduler-decay-ratio` (0.2)     |
 | `--loss-fn`             | kl_div  | Stage 2 divergence to the map's target (stage 1 is cross-entropy to the data) |
 
-FlashMap trains over the verifier's full vocabulary (`--draft-vocab-size` is not supported); a restricted vocabulary is a serving-time option (above). Flags of the DFlash group that FlashMap ignores (`--sample-from-anchor`, `--per-position-loss-weight`, `--dpace-alpha`) warn when set.
+FlashMap trains over the verifier's full vocabulary (`--draft-vocab-size` is not supported); a restricted vocabulary is a serving-time option, set at conversion (above). Flags of the DFlash group that FlashMap ignores (`--sample-from-anchor`, `--per-position-loss-weight`, `--dpace-alpha`) warn when set.
 
 ## Research & Citation
 
-FlashMap distils the flow maps of [Flow Map Language Models](https://arxiv.org/abs/2602.16813) into a speculative drafter conditioned like [DFlash](https://arxiv.org/abs/2602.06036).
+FlashMap distills the flow maps of [Flow Map Language Models](https://arxiv.org/abs/2602.16813) into a speculative drafter conditioned like [DFlash](https://arxiv.org/abs/2602.06036).
 
 ## See Also
 
-- [FlashMap](flashmap.md) -- Serving a trained FlashMap drafter in vLLM
+- [FlashMap](flashmap.md) -- What FlashMap is, and serving it with the flashmap package
 - [DFlash](dflash.md) -- The block drafter whose conditioning and anchor sampling FlashMap shares
 - [Train a Speculator](../tutorials/train.md) -- Data generation and the online/offline training modes

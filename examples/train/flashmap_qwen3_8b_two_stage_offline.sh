@@ -3,8 +3,9 @@
 #
 # Runs the full offline FlashMap pipeline: response regeneration, data preparation,
 # hidden-state generation, then the two training stages from the cached hidden
-# states -- the flow (stage 1) and the flow map distilled from it (stage 2). The
-# hidden states are generated once and read by both stages.
+# states -- the flow (stage 1) and the flow map distilled from it (stage 2) -- and
+# the conversion of the flow map to the release format that the flashmap package
+# serves. The hidden states are generated once and read by both stages.
 #
 # Usage: Copy this script, modify the configuration variables below, then run:
 #   bash examples/train/flashmap_qwen3_8b_two_stage_offline.sh
@@ -86,7 +87,8 @@ speculators prepare-data \
     --render-endpoint "http://localhost:${VLLM_PORT}" \
     --max-samples "$MAX_SAMPLES" \
     --output "$OUTPUT_DIR" \
-    --seq-length "$SEQ_LENGTH"
+    --seq-length "$SEQ_LENGTH" \
+    --no-skip-token-freq  # token_freq.pt: the draft vocabulary of the release (Step 7)
 
 # Step 3: Generate hidden states
 echo "=== Step 3: Generating hidden states ==="
@@ -123,7 +125,7 @@ CUDA_VISIBLE_DEVICES="$GPUS" torchrun \
     --total-seq-len "$SEQ_LENGTH" \
     --on-missing raise
 
-# Step 6: Distil the flow map from the last flow checkpoint
+# Step 6: Distill the flow map from the last flow checkpoint
 echo "=== Step 6: Training the flow map (stage 2) ==="
 CUDA_VISIBLE_DEVICES="$GPUS" torchrun \
     --standalone --nproc_per_node "$NUM_GPUS" \
@@ -147,4 +149,14 @@ CUDA_VISIBLE_DEVICES="$GPUS" torchrun \
     --total-seq-len "$SEQ_LENGTH" \
     --on-missing raise
 
-echo "Done. The flow map checkpoints in $OUTPUT_DIR/map/ are the drafter to serve."
+# Step 7: Convert the last flow map checkpoint to the FlashMap release format, with
+# a draft vocabulary from the token frequencies prepare-data wrote
+echo "=== Step 7: Converting the flow map to the release format ==="
+speculators convert "$OUTPUT_DIR/map/$((MAP_EPOCHS - 1))" \
+    --algorithm flashmap \
+    --verifier "$MODEL" \
+    --output-path "$OUTPUT_DIR/FlashMap-release" \
+    --algorithm-kwargs "{\"draft_vocab_file\": \"$OUTPUT_DIR/token_freq.pt\"}"
+
+echo "Done. Serve $OUTPUT_DIR/FlashMap-release with the flashmap package:"
+echo "  vllm serve $MODEL --speculative-config '{\"model\": \"$OUTPUT_DIR/FlashMap-release\", \"num_speculative_tokens\": 16}'"

@@ -308,7 +308,7 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
         d2t: torch.Tensor | None = None,
         draft_attn_impl: str | None = None,
     ) -> "FlashMapDraftModel":
-        """A flow map initialized from a trained flow, which it then distils.
+        """A flow map initialized from a trained flow, which it then distills.
 
         The flow map's two-time denoiser on the diagonal is the flow's denoiser
         (Proposition 3.3(iii) of the paper), so copying the flow's weights, with
@@ -340,7 +340,7 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
         return model
 
     def attach_teacher(self, teacher: "FlashMapDraftModel") -> None:
-        """Keep a frozen flow to distil from, outside ``parameters()`` and
+        """Keep a frozen flow to distill from, outside ``parameters()`` and
         ``state_dict()``: a checkpoint holds exactly the trained network.
 
         The teacher reads and writes the vocabulary through the same frozen

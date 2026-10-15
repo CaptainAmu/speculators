@@ -46,7 +46,7 @@ torchrun --standalone --nproc_per_node=4 -m speculators.train \
 
 - **`--trust-remote-code`** (flag) Allow executing code from HF Hub when loading the verifier's tokenizer.
 
-- **`--speculator-type`** (str, default: `"eagle3"`) Type of speculator model to train. Options: `eagle3`, `dflash`, `dflash2`, `dspark`, `peagle`, `mtp`
+- **`--speculator-type`** (str, default: `"eagle3"`) Type of speculator model to train. Options: `eagle3`, `dflash`, `dflash2`, `dspark`, `flashmap`, `peagle`, `mtp`
 
 - **`--from-pretrained`** (str, default: `""`) Path or HF id of an existing draft checkpoint to load weights from and train — either a previously trained draft or the initialized-but-untrained checkpoint produced by `--dry-run`. May also point to a local directory containing only a `config.json`, in which case a fresh draft is initialized from that full speculator config. Takes precedence over all other model-definition options: it is mutually exclusive with `--draft-config` and the decoder-shaping flags (`--num-layers`, `--draft-arch`, `--draft-hidden-act`, `--sliding-window`, `--full-attention-indices`).
 
@@ -54,7 +54,7 @@ torchrun --standalone --nproc_per_node=4 -m speculators.train \
 
 - **`--dry-run`** (flag) Build the speculator, initialize weights, save a checkpoint to `--save-path`, then exit before training. Useful to validate the config/weights in vLLM before launching a full run; the saved checkpoint can be fed straight back via `--from-pretrained`.
 
-- **`--num-layers`** (int, default: `5` for dflash/dspark/dflash2, `1` otherwise) Number of transformer layers in the draft model.
+- **`--num-layers`** (int, default: `6` for flashmap, `5` for dflash/dspark/dflash2, `1` otherwise) Number of transformer layers in the draft model (DiT blocks for flashmap).
 
 - **`--draft-arch`** (str, default: `"llama"`) Architecture for the synthesized draft decoder layers. Options: `llama`, `qwen3`. Used by Eagle3 and P-EAGLE, which select the decoder layer class from this value; DFlash-family models always use a Qwen3-style decoder regardless. Both are supported in vLLM for inference, and the target and draft architectures do not have to match.
 
@@ -135,6 +135,8 @@ torchrun --standalone --nproc_per_node=4 -m speculators.train \
 
 - **`--weight-decay`** (float, default: `0.01`) Weight decay for the AdamW optimizer (and the AdamW group in muon mode).
 
+- **`--adam-beta2`** (float, default: `0.999`) AdamW second-moment decay beta2 (and the AdamW group's in muon mode). Lower values such as `0.95` adapt faster to gradient-scale changes.
+
 - **`--muon-lr`** (float, default: `lr`) Learning rate for the Muon (2D weights) group. Only used with `--optimizer muon`. Defaults to the `--lr` value.
 
 - **`--muon-momentum`** (float, default: `0.95`) Momentum for the Muon optimizer. Only used with `--optimizer muon`.
@@ -179,9 +181,9 @@ torchrun --standalone --nproc_per_node=4 -m speculators.train \
 
 - **`--sample-from-anchor`** / **`--no-sample-from-anchor`** (bool, default: algorithm-specific) Whether to sample from the anchor position. `True`: sample from anchor and all mask positions (default for dspark, produces block_size tokens). `False`: anchor is bonus token (default for dflash/dflash2, produces block_size-1 tokens).
 
-- **`--max-anchors`** (int, default: `512`) Maximum anchor positions for DFlash-family and P-EAGLE training.
+- **`--max-anchors`** (int, default: `512`; `128` for a FlashMap flow map, i.e. with `--flashmap-teacher`) Maximum anchor positions per packed row for DFlash-family, FlashMap and P-EAGLE training.
 
-- **`--dflash-decay-gamma`** (float, default: `4.0`) Decay gamma for DFlash-family loss weighting.
+- **`--dflash-decay-gamma`** (float, default: `7.0` for flashmap, `4.0` otherwise) Decay gamma for DFlash-family loss weighting (for flashmap, `0` disables the decay).
 
 - **`--per-position-loss-weight`** (str, default: `"dpace"` for dflash, `"fixed-exp-decay"` otherwise) Per-position loss weighting scheme. Options: `fixed-exp-decay`, `dpace`. Applies to DFlash-family models. `dpace` requires `--loss-fn ce`.
 
@@ -200,6 +202,24 @@ DFlash2 builds on DFlash, so all DFlash-specific arguments apply as well. It def
 - **`--selector-top-k`** (int, default: `16`) Number of candidates retained per position.
 
 - **`--selector-loss-alpha`** (float, default: `1.0`) Weight of the candidate-selector K-way cross-entropy term.
+
+### FlashMap-Specific Arguments
+
+FlashMap trains in two stages: the flow (stage 1, without `--flashmap-teacher`) and the flow map distilled from it (stage 2). See [Training FlashMap](../user_guide/algorithms/flashmap_training.md).
+
+- **`--flashmap-teacher`** (str, default: `None`) Stage 2: a trained stage-1 flow checkpoint. The flow map is initialized from it, takes its architecture, and is distilled from it. Mutually exclusive with `--from-pretrained`.
+
+- **`--dit-hidden-size`** (int, default: `2048`) Width of the DiT denoiser (stage 1).
+
+- **`--dit-num-heads`** (int, default: `16`) Attention heads of the DiT (stage 1).
+
+- **`--timestep-embed-dim`** (int, default: `256`) Width of the DiT's time embedding and AdaLN condition (stage 1).
+
+- **`--diagonal-fraction`** (float, default: `0.5`) Stage 2: fraction of blocks trained on the diagonal against the frozen flow.
+
+- **`--boundary-prob`** (float, default: `0.0625`) Stage 2: fraction of the off-diagonal blocks trained on the drafting jump `(s, t) = (0, 1)`.
+
+- **`--antithetic-sampling`** / **`--no-antithetic-sampling`** (flag, default: `True`) Stage 2: stratify the time draws over the batch.
 
 ### DSpark-Specific Arguments
 
@@ -239,7 +259,7 @@ All speculator types (except `mtp`) use sliding window attention on all draft la
 
 ### Learning Rate Scheduler Arguments
 
-- **`--scheduler-type`** (str, default: `"linear"`) Type of learning rate scheduler. Options: `linear`, `cosine`, `none`
+- **`--scheduler-type`** (str, default: `"linear"`) Type of learning rate scheduler. Options: `linear`, `cosine`, `wsd`, `none`. `wsd`: warmup, hold, then a cosine anneal over the last `--scheduler-decay-ratio` of the steps.
 
 - **`--scheduler-warmup-steps`** (int, default: `None`) Number of warmup steps for the scheduler.
 
@@ -248,6 +268,8 @@ All speculator types (except `mtp`) use sliding window attention on all draft la
 - **`--scheduler-total-steps`** (int, default: `None`) Total number of training steps for the scheduler.
 
 - **`--scheduler-num-cosine-cycles`** (float, default: `0.5`) Number of cosine cycles for cosine scheduler.
+
+- **`--scheduler-decay-ratio`** (float, default: `0.2`) Fraction of the total steps the `wsd` scheduler anneals over.
 
 ## Examples
 

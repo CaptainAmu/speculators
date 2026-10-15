@@ -4,6 +4,10 @@ import pytest
 import torch
 import torch.distributed as dist
 from safetensors import safe_open
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    set_model_state_dict,
+)
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Config
 
 from speculators.config import SpeculatorsConfig, VerifierConfig
@@ -530,7 +534,16 @@ def test_fully_sharded_on_one_rank(tmp_path, stage):
         model = _tiny_flow()
         if stage == "map":
             model = FlashMapDraftModel.from_teacher(model)
+        # As Trainer._setup_model_fsdp: shard, then broadcast rank 0's weights.
+        full_state_dict = model.state_dict()
         apply_fully_sharded(model.train(), param_dtype=torch.float32)
+        set_model_state_dict(
+            model,
+            full_state_dict,
+            options=StateDictOptions(
+                full_state_dict=True, broadcast_from_rank0=True, strict=False
+            ),
+        )
         _, loss, _ = model(**_batch(), max_anchors=8, loss_config=EAGER_KL)
         loss.backward()
         grad = model.layers[0].cross_attn.k_proj.weight.grad

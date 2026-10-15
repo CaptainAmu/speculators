@@ -117,8 +117,11 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
                 "FlashMap trains over the verifier's full vocabulary; omit "
                 "--draft-vocab-size (a restricted vocabulary is a serving option)."
             )
-        # The frozen verifier lm_head and the draft lm_head are the same matrix.
-        self.verifier_lm_head = self.lm_head
+        # The frozen verifier lm_head and the draft lm_head are the same matrix:
+        # alias it outside the module tree, so that it is neither stored twice nor
+        # seen twice by state dicts (FSDP's broadcast of rank 0's weights).
+        del self.verifier_lm_head
+        self.__dict__["verifier_lm_head"] = self.lm_head
 
         hidden_size = config.target_hidden_size
         if hidden_size is None:
@@ -344,7 +347,8 @@ class FlashMapDraftModel(DraftVocabMixin, SpeculatorModel):
         verifier matrices, so it shares this model's, and it runs in this model's
         dtype."""
         teacher.embed_tokens = self.embed_tokens
-        teacher.lm_head = teacher.verifier_lm_head = self.lm_head
+        teacher.lm_head = self.lm_head
+        teacher.__dict__["verifier_lm_head"] = self.lm_head
         teacher.to(dtype=self.fc.weight.dtype)  # type: ignore[call-arg]
         teacher.requires_grad_(False).eval()
         self._teacher = [teacher]

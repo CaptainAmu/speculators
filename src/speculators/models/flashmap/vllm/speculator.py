@@ -88,21 +88,10 @@ class FlashMapSpeculator(DFlashSpeculator):
         model.prepare()
         # Key each query row's noise by its request's seed and its position.
         model.set_noise_keys(self.seeds, self.sample_idx_mapping)
-        self._full_logits: torch.Tensor | None = None
-        if self.draft_logits is not None and model.hot_ids is not None:
-            if self.draft_watermarker is not None:
-                raise ValueError(
-                    "Watermarked drafting needs FlashMap's full draft vocabulary."
-                )
-            if not model.experimental:
-                # Probabilistic verification reads the draft distribution over
-                # the target vocabulary: tokens outside the draft's get -inf.
-                self._full_logits = torch.full(
-                    (self.max_num_reqs * self.num_speculative_steps, self.vocab_size),
-                    float("-inf"),
-                    dtype=self.draft_logits.dtype,
-                    device=self.device,
-                )
+        if self.draft_watermarker is not None and model.hot_ids is not None:
+            raise ValueError(
+                "Watermarked drafting needs FlashMap's full draft vocabulary."
+            )
         return model
 
     def load_model(self, target_model: nn.Module) -> None:
@@ -118,12 +107,7 @@ class FlashMapSpeculator(DFlashSpeculator):
     ) -> None:
         # The context rows a draft step stores right before its forward are
         # projected by the forward's GEMM, together with the anchors.
-        if (
-            self.model.experimental
-            and start == 0
-            and not dummy_run
-            and self._layer_group_idx is None
-        ):
+        if start == 0 and not dummy_run and self._layer_group_idx is None:
             self.model.defer_context_kv(
                 self.hidden_states[start:end],
                 self.context_positions[start:end],
@@ -192,17 +176,8 @@ class FlashMapSpeculator(DFlashSpeculator):
     ) -> torch.Tensor:
         logits = self.model.compute_draft_logits(hidden_states)
         hot_ids = self.model.hot_ids
-        if self._full_logits is not None and draft_logits is not None:
-            # Over the target vocabulary: the draft's columns, -inf elsewhere.
-            full = self._full_logits[: logits.shape[0]]
-            full.index_copy_(1, hot_ids, logits.to(full.dtype))
-            logits, hot_ids = full, None
         if draft_logits is None:
-            sampled = (
-                split_argmax(logits)
-                if self.model.experimental
-                else logits.argmax(dim=-1)
-            )
+            sampled = split_argmax(logits)
         elif hot_ids is None:
             sampled = gumbel_sample(
                 logits,

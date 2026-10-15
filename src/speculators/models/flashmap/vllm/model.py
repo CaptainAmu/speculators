@@ -28,15 +28,9 @@ run the reference algorithm exactly, with a vocabulary-sized state.
 Requirements: the V2 model runner, tensor parallel size 1, the FlashAttention
 backend and a bf16 KV cache (checked at load).
 
-``FLASHMAP_EXPERIMENTAL=1`` turns on draft-step changes that are not yet
-validated on a GPU: the committed context and the anchors projected by one GEMM
-(one read of the context K/V weight per step instead of two), a compiled
-prologue, one FlashAttention 3 tile schedule shared by every layer, noise keyed
-by each request's seed and position (seeded requests become reproducible at
-temperature > 0), a split argmax, and restricted-vocabulary sampling that writes
-the cached proposal distribution directly instead of through a
-vocabulary-sized buffer. ``FLASHMAP_NUM_STEPS`` overrides the checkpoint's
-number of jumps.
+The draft noise is keyed by each request's seed and the slot's position, so a
+seeded request drafts the same blocks on every run. ``FLASHMAP_NUM_STEPS``
+overrides the checkpoint's number of jumps.
 """
 
 import os
@@ -250,8 +244,6 @@ class FlashMapDraftModel(nn.Module):
             raise ValueError(f"FlashMap drafting runs in bfloat16, not {self.dtype}")
         self.max_model_len = vllm_config.model_config.max_model_len
         self.block_size = int(config.block_size)
-        # Draft-step changes not yet validated on a GPU (see the module docstring).
-        self.experimental = os.environ.get("FLASHMAP_EXPERIMENTAL", "0") == "1"
         # FLASHMAP_NUM_STEPS overrides the checkpoint's number of jumps.
         self.num_steps = int(os.environ.get("FLASHMAP_NUM_STEPS", config.num_steps))
         self.time_grid = [float(t) for t in config.time_grids[self.num_steps - 1]]
@@ -307,7 +299,7 @@ class FlashMapDraftModel(nn.Module):
         return set(params)
 
     @torch.no_grad()
-    def prepare(self) -> None:  # noqa: C901
+    def prepare(self) -> None:
         """Precompute what the draft step needs, once the target's embedding
         (``model.embed_tokens``) and LM head (``lm_head``) are attached."""
         model = self.model
@@ -425,10 +417,9 @@ class FlashMapDraftModel(nn.Module):
         self._one_jump_fn = self._one_jump
         self._dit_fn = self._dit
         if self.compile:
-            if self.experimental:
-                self._prologue_fn = torch.compile(
-                    self._prologue, dynamic=True, fullgraph=True
-                )
+            self._prologue_fn = torch.compile(
+                self._prologue, dynamic=True, fullgraph=True
+            )
             self._one_jump_fn = torch.compile(
                 self._one_jump, dynamic=True, fullgraph=True
             )
@@ -681,7 +672,7 @@ class FlashMapDraftModel(nn.Module):
 
     def _noise(self, positions: torch.Tensor, n_cols: int) -> torch.Tensor:
         tokens = positions.shape[0]
-        if self._noise_keys is None or not self.experimental:
+        if self._noise_keys is None:
             noise = torch.randn(
                 tokens, n_cols, device=positions.device, dtype=torch.float32
             )
@@ -692,11 +683,7 @@ class FlashMapDraftModel(nn.Module):
     def _cross_attention_schedule(self, metadata, seqused_k):
         """FlashAttention 3's tile schedule for the step's cross-attention,
         shared by every layer (it depends only on shapes and lengths)."""
-        if (
-            not self.experimental
-            or self.fa_version != 3  # noqa: PLR2004
-            or get_scheduler_metadata is None
-        ):
+        if self.fa_version != 3 or get_scheduler_metadata is None:  # noqa: PLR2004
             return None
         caches = self.layers[0].cross_attn.attn.kv_cache
         return get_scheduler_metadata(

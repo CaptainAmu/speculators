@@ -18,11 +18,15 @@
 #   PROMPT_DIR=./bench_prompts OUT=./runs/qwen3_8b \
 #   bash examples/evaluate/flashmap/bench_flashmap_vllm.sh
 #
-# SERVERS entries are <label>=none | <label>=<method>:<draft>[:<env>=<value>...],
+# SERVERS entries are <label>=none[:<env>=<value>...] |
+#   <label>=<method>:<draft>[:<env>=<value>...],
 #   <method> one of dflash, flashmap. Trailing <env>=<value> pairs are exported
 #   for that server only, e.g. fm2=flashmap:./FlashMap-Qwen3-8B:FLASHMAP_NUM_STEPS=2
 #   or fm8=flashmap:./FlashMap-Qwen3-8B:NUM_SPEC=8 (verify 8 of the 16 drafts)
-#   or fmkv=flashmap:./FlashMap-Qwen3-8B:DRAFT_KV_DTYPE=fp8_e4m3 (fp8 draft KV cache).
+#   or fmkv=flashmap:./FlashMap-Qwen3-8B:DRAFT_KV_DTYPE=fp8_e4m3 (fp8 draft KV cache);
+#   a PREFIX_CACHING=1 pair turns vLLM's prefix caching on for that server.
+# Prefix caching is off by default so that no method gains from prompts shared
+#   across points (the warmup requests reuse the dataset's prompts).
 # Requests sample at TEMPERATURE with no top-k/top-p (--generation-config vllm
 #   ignores the model's sampling defaults); above 0, drafts are sampled too
 #   ("draft_sample_method": "probabilistic").
@@ -73,11 +77,17 @@ run_server() {
         return 1
     fi
     local -a args=(serve "$TARGET" --port "$PORT" --max-model-len "$MAX_MODEL_LEN"
-        --gpu-memory-utilization "$GPU_UTIL" --no-enable-prefix-caching
-        --max-num-seqs 64 --generation-config vllm)
+        --gpu-memory-utilization "$GPU_UTIL" --max-num-seqs 64 --generation-config vllm)
     local -a envs=()
-    if [[ "$spec" != "none" ]]; then
-        IFS=: read -r -a parts <<< "$spec"
+    local prefix_caching=0
+    IFS=: read -r -a parts <<< "$spec"
+    for pair in "${parts[@]}"; do
+        [[ "$pair" == PREFIX_CACHING=1 ]] && prefix_caching=1
+    done
+    [[ "$prefix_caching" == 1 ]] || args+=(--no-enable-prefix-caching)
+    if [[ "${parts[0]}" == "none" ]]; then
+        envs=("${parts[@]:1}")
+    else
         local method="${parts[0]}" draft="${parts[1]}"
         envs=("${parts[@]:2}")
         local num_spec=$NUM_SPEC kv_dtype=""

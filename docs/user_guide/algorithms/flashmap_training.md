@@ -76,7 +76,7 @@ The folder holds `config.json`, `model.safetensors` (bf16, without the verifier'
 Serve the folder with the flashmap package:
 
 ```bash
-uv pip install "vllm==0.31.*" "flashmap[vllm] @ git+https://github.com/al-jshen/flashmap"
+uv pip install "vllm==0.31.*" "flashmap[vllm]"
 vllm serve Qwen/Qwen3-8B --speculative-config '{"model": "./FlashMap-Qwen3-8B-mine", "num_speculative_tokens": 16}'
 ```
 

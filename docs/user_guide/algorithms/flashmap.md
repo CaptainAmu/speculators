@@ -15,7 +15,7 @@ uv pip install "speculators @ git+https://github.com/al-jshen/speculators@flashm
 To serve FlashMap, use the [flashmap](https://github.com/al-jshen/flashmap) package. Its vLLM plugin serves the released drafters ([j-shen/FlashMap-Qwen3-8B](https://huggingface.co/j-shen/FlashMap-Qwen3-8B), [j-shen/FlashMap-Qwen3-4B](https://huggingface.co/j-shen/FlashMap-Qwen3-4B)) and drafters converted from speculators checkpoints:
 
 ```bash
-uv pip install "vllm==0.31.*" "flashmap[vllm] @ git+https://github.com/al-jshen/flashmap"
+uv pip install "vllm==0.31.*" "flashmap[vllm]"
 vllm serve Qwen/Qwen3-8B --speculative-config '{"model": "j-shen/FlashMap-Qwen3-8B", "num_speculative_tokens": 16}'
 ```
 

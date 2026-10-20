@@ -21,6 +21,22 @@ vllm serve Qwen/Qwen3-8B --speculative-config '{"model": "j-shen/FlashMap-Qwen3-
 
 The flashmap package documents the requirements and options of serving, and its SGLang and Hugging Face `transformers` integrations.
 
+## Research & Citation
+
+FlashMap: [Project Page](https://jshen.net/flashmap) | [arXiv Paper](https://arxiv.org/abs/2610.24365)
+
+```bibtex
+@misc{flashmap2026,
+  title         = {{FlashMap}: Flow Map Speculative Decoding},
+  author        = {Shen, Jeff and Zhou, Zhejian and Lee, Ryan and May, Jonathan and Ho, Shirley},
+  year          = {2026},
+  eprint        = {2610.24365},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.CL},
+  url           = {https://arxiv.org/abs/2610.24365}
+}
+```
+
 ## See Also
 
 - [Training FlashMap](flashmap_training.md) -- The two training stages and the conversion to the release format

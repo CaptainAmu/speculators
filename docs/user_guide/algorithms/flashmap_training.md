@@ -102,7 +102,7 @@ FlashMap trains over the verifier's full vocabulary (`--draft-vocab-size` is not
 
 ## Research & Citation
 
-FlashMap distills the flow maps of [Flow Map Language Models](https://arxiv.org/abs/2602.16813) into a speculative drafter conditioned like [DFlash](https://arxiv.org/abs/2602.06036).
+FlashMap is described in [FlashMap: Flow Map Speculative Decoding](https://arxiv.org/abs/2610.24365) ([project page](https://jshen.net/flashmap); BibTeX in [FlashMap](flashmap.md)). It distills the flow maps of [Flow Map Language Models](https://arxiv.org/abs/2602.16813) into a speculative drafter conditioned like [DFlash](https://arxiv.org/abs/2602.06036).
 
 ## See Also
 
